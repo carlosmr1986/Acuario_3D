@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0b4f75" />
+      <stop offset="55%" stop-color="#062942" />
+      <stop offset="100%" stop-color="#031524" />
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="22%" r="60%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#062942" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="fishBody" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fb923c" />
+      <stop offset="55%" stop-color="#f97316" />
+      <stop offset="100%" stop-color="#c2410c" />
+    </linearGradient>
+    <linearGradient id="finGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fdba74" />
+      <stop offset="100%" stop-color="#ea580c" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#bg)" />
+  <rect width="512" height="512" fill="url(#glow)" />
+
+  <!-- Subtle caustic rays -->
+  <polygon points="150,0 245,0 320,330 205,330" fill="#7dd3fc" opacity="0.09" />
+  <polygon points="285,0 355,0 415,290 335,290" fill="#7dd3fc" opacity="0.07" />
+
+  <!-- Sand floor arc -->
+  <path d="M0,415 Q160,388 320,410 T512,398 L512,512 L0,512 Z" fill="#c2a373" opacity="0.32" />
+
+  <!-- Decorative aquatic leaves -->
+  <path d="M98,448 C82,380 86,315 112,268 C120,320 118,385 112,448 Z" fill="#10b981" opacity="0.65" />
+  <path d="M126,454 C128,392 146,342 172,306 C165,360 150,408 140,454 Z" fill="#34d399" opacity="0.55" />
+
+  <!-- Bubbles -->
+  <circle cx="385" cy="140" r="14" fill="#e0f2fe" fill-opacity="0.28" stroke="#bae6fd" stroke-width="3" />
+  <circle cx="408" cy="186" r="9" fill="#e0f2fe" fill-opacity="0.26" stroke="#bae6fd" stroke-width="2.5" />
+  <circle cx="372" cy="218" r="6" fill="#e0f2fe" fill-opacity="0.3" />
+
+  <!-- Tropical fish facing right -->
+  <g transform="translate(262,258)">
+    <!-- Tail fin -->
+    <path d="M-92,0 L-156,-48 C-142,-16 -142,16 -156,48 Z" fill="url(#finGrad)" stroke="#7c2d12" stroke-width="5" stroke-linejoin="round" />
+    <!-- Dorsal fin -->
+    <path d="M-44,-46 C-18,-88 26,-86 48,-46 Z" fill="url(#finGrad)" stroke="#7c2d12" stroke-width="5" stroke-linejoin="round" />
+    <!-- Ventral fin -->
+    <path d="M-24,46 C-10,76 18,74 28,44 Z" fill="url(#finGrad)" stroke="#7c2d12" stroke-width="4" stroke-linejoin="round" />
+    <!-- Body -->
+    <path d="M-96,0 C-72,-62 46,-70 112,0 C46,70 -72,62 -96,0 Z" fill="url(#fishBody)" stroke="#7c2d12" stroke-width="5" />
+    <!-- White clownfish bands -->
+    <path d="M22,-54 C36,-22 36,22 22,54 L42,50 C54,18 54,-18 42,-50 Z" fill="#f8fafc" opacity="0.95" />
+    <path d="M-46,-44 C-34,-16 -34,16 -46,44 L-26,48 C-16,18 -16,-18 -26,-48 Z" fill="#f8fafc" opacity="0.92" />
+    <!-- Pectoral fin -->
+    <path d="M-8,8 C-34,4 -46,24 -32,36 C-18,44 0,28 -8,8 Z" fill="#fed7aa" stroke="#9a3412" stroke-width="4" />
+    <!-- Eye -->
+    <circle cx="70" cy="-12" r="12" fill="#ffffff" />
+    <circle cx="73" cy="-12" r="7" fill="#0f172a" />
+    <circle cx="75" cy="-15" r="2.5" fill="#ffffff" />
+  </g>
+</svg>

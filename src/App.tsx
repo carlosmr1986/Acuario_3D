@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { AquariumCanvas, type AquariumCanvasHandle } from './components/AquariumCanvas';
 import { BottomDock } from './components/BottomDock';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAControls';
 import type {
   AquariumCounts,
   AquariumLighting,
@@ -144,12 +145,12 @@ export default function App() {
           </div>
         </div>
 
-        <div className="pointer-events-auto flex items-center gap-1.5 sm:gap-2 shrink-0">
+        <div className="pointer-events-auto flex items-center gap-1 sm:gap-2 shrink-0">
           <button
             type="button"
             onClick={() => aquariumRef.current?.dropFood()}
             aria-label="Echar comida a los peces"
-            className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium text-amber-100 bg-amber-600/85 hover:bg-amber-500 active:scale-[0.94] border border-amber-300/45 transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0"
+            className="min-h-[38px] sm:min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium text-amber-100 bg-amber-600/85 hover:bg-amber-500 active:scale-[0.94] border border-amber-300/45 transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0"
           >
             <Cookie className="w-3.5 h-3.5 text-amber-100 shrink-0" aria-hidden="true" />
             <span className={editMode ? 'hidden sm:inline' : ''}>Comida</span>
@@ -160,7 +161,7 @@ export default function App() {
             onClick={handleToggleEditMode}
             aria-pressed={editMode}
             aria-label={editMode ? 'Finalizar edición del acuario' : 'Activar modo edición'}
-            className={`min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium active:scale-[0.96] border transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0 ${
+            className={`min-h-[38px] sm:min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium active:scale-[0.96] border transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0 ${
               editMode
                 ? 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-300/70'
                 : 'text-white bg-slate-950/85 hover:bg-slate-950/95 border-white/25'
@@ -179,7 +180,7 @@ export default function App() {
             onClick={handleToggleLighting}
             aria-label="Control de iluminación"
             aria-expanded={lightingOpen}
-            className={`min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium active:scale-[0.96] border transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0 ${
+            className={`min-h-[38px] sm:min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium active:scale-[0.96] border transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0 ${
               lightingOpen
                 ? 'bg-sky-500 text-white border-sky-300/70'
                 : 'text-amber-100 bg-slate-950/85 hover:bg-slate-950/95 border-white/20'
@@ -198,18 +199,20 @@ export default function App() {
             type="button"
             onClick={() => aquariumRef.current?.resetCamera()}
             aria-label="Centrar cámara"
-            className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium text-sky-100 bg-slate-950/85 hover:bg-slate-950/95 active:scale-[0.96] border border-white/20 transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0"
+            className="min-h-[38px] sm:min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium text-sky-100 bg-slate-950/85 hover:bg-slate-950/95 active:scale-[0.96] border border-white/20 transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0"
           >
             <Compass className="w-3.5 h-3.5 text-sky-300 shrink-0" aria-hidden="true" />
             <span className="hidden sm:inline">Centrar</span>
           </button>
+
+          {!editMode && <PWAInstallButton />}
 
           {editMode && (
             <button
               type="button"
               onClick={handleReset}
               aria-label="Reiniciar acuario"
-              className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium text-white bg-slate-950/85 hover:bg-slate-950/95 active:scale-[0.96] border border-white/25 transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0"
+              className="min-h-[38px] sm:min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium text-white bg-slate-950/85 hover:bg-slate-950/95 active:scale-[0.96] border border-white/25 transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0"
             >
               <RotateCcw className="w-3.5 h-3.5 text-sky-200 shrink-0" aria-hidden="true" />
               <span>Reiniciar</span>
@@ -353,6 +356,8 @@ export default function App() {
           onAddFish={() => aquariumRef.current?.addFish()}
         />
       )}
+
+      <OfflineIndicator />
     </div>
   );
 }
