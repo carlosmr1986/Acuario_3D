@@ -28,14 +28,15 @@ export interface AquariumCanvasHandle {
 interface AquariumCanvasProps {
   onCountsChange: (counts: AquariumCounts) => void;
   onSelectionChange: (selected: SelectedDecor | null) => void;
+  onLightingLoaded?: (lighting: AquariumLighting) => void;
 }
 
 export const AquariumCanvas = forwardRef<AquariumCanvasHandle, AquariumCanvasProps>(
-  function AquariumCanvas({ onCountsChange, onSelectionChange }, ref) {
+  function AquariumCanvas({ onCountsChange, onSelectionChange, onLightingLoaded }, ref) {
     const mountRef = useRef<HTMLDivElement | null>(null);
     const controllerRef = useRef<AquariumScene3DController | null>(null);
-    const callbacksRef = useRef({ onCountsChange, onSelectionChange });
-    callbacksRef.current = { onCountsChange, onSelectionChange };
+    const callbacksRef = useRef({ onCountsChange, onSelectionChange, onLightingLoaded });
+    callbacksRef.current = { onCountsChange, onSelectionChange, onLightingLoaded };
 
     useImperativeHandle(
       ref,
@@ -62,6 +63,7 @@ export const AquariumCanvas = forwardRef<AquariumCanvasHandle, AquariumCanvasPro
       const controller = new AquariumScene3DController(mount, {
         onCountsChange: (counts) => callbacksRef.current.onCountsChange(counts),
         onSelectionChange: (selected) => callbacksRef.current.onSelectionChange(selected),
+        onLightingLoaded: (lighting) => callbacksRef.current.onLightingLoaded?.(lighting),
       });
       controllerRef.current = controller;
 
@@ -76,7 +78,7 @@ export const AquariumCanvas = forwardRef<AquariumCanvasHandle, AquariumCanvasPro
         ref={mountRef}
         role="application"
         aria-label="Acuario interactivo 3D. Arrastra sobre el cristal para rotar la vista, toca el agua para crear ondas, toca un pez para que huya, o arrastra piedras y plantas 3D para ordenarlas o apilarlas."
-        className="w-full h-full cursor-grab active:cursor-grabbing touch-none select-none"
+        className="w-full h-full bg-black cursor-grab active:cursor-grabbing touch-none select-none"
       />
     );
   }

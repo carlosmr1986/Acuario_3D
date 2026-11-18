@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { PlantStyle } from '../types/aquarium';
 import type { AquariumPhotoTextures } from './photoTextures';
+import { applyWaterDepthFog, type WaterFogUniforms } from './waterFogShader';
 
 export interface Rock3DHandle {
   group: THREE.Group;
@@ -19,6 +20,7 @@ export interface Plant3DHandle {
     uPhase: { value: number };
     uSpeed: { value: number };
     uMotionAmp: { value: number };
+    uFishPushers: { value: THREE.Vector4[] };
   };
   geometries: THREE.BufferGeometry[];
   materials: THREE.Material[];
@@ -205,7 +207,7 @@ varying vec3 vRockWorldNorm;`
       .replace(
         '#include <map_fragment>',
         `#ifdef USE_MAP
-  vec3 blendW = abs(normalize(vRockLocalNorm));
+  vec3 blendW = max(abs(normalize(vRockLocalNorm)), vec3(0.0001));
   blendW = pow(blendW, vec3(4.0));
   blendW /= max(0.0001, blendW.x + blendW.y + blendW.z);
   vec3 tp = vRockLocalPos * 1.65;
@@ -222,7 +224,7 @@ varying vec3 vRockWorldNorm;`
 vec2 uvR = vRockWorldPos.xz * 1.6;
 float c1 = sin(uvR.x * 2.1 + tR + cos(uvR.y * 1.9 - tR * 0.8));
 float c2 = cos(uvR.y * 2.4 - tR * 1.1 + sin(uvR.x * 2.2 + tR * 0.7));
-float causticR = pow(max(0.0, 1.0 - abs(c1 + c2) * 0.65), 3.2);
+float causticR = pow(max(0.0001, 1.0 - abs(c1 + c2) * 0.65), 3.2);
 float upMask = smoothstep(0.2, 0.85, vRockWorldNorm.y);
 gl_FragColor.rgb += vec3(0.11, 0.24, 0.29) * causticR * upMask * 0.65 * uCausticIntensity;
 #include <dithering_fragment>`
@@ -243,7 +245,8 @@ export function createRock3D(
     uMotionAmp: { value: number };
     uCausticIntensity: { value: number };
   },
-  isSoftwareGl: boolean
+  isSoftwareGl: boolean,
+  waterFog?: WaterFogUniforms
 ): Rock3DHandle {
   const rand = makeSeededRand(seed);
   const group = new THREE.Group();
@@ -273,6 +276,7 @@ export function createRock3D(
     clearcoatRoughness: 0.24,
   });
   applyTriplanarRockShader(mainMat, rockUniforms);
+  if (waterFog) applyWaterDepthFog(mainMat, waterFog, 1.0);
   materials.push(mainMat);
 
   const mainMesh = new THREE.Mesh(mainSculpt.geometry, mainMat);
@@ -296,6 +300,7 @@ export function createRock3D(
     clearcoatRoughness: 0.3,
   });
   applyTriplanarRockShader(secMat, rockUniforms);
+  if (waterFog) applyWaterDepthFog(secMat, waterFog, 1.0);
   materials.push(secMat);
 
   for (let i = 0; i < 2; i++) {
@@ -352,8 +357,8 @@ function build3DBotanicalLeafGeometry(
   for (let i = 0; i < pos.count; i++) {
     const rawX = pos.getX(i); // -0.5 .. +0.5
     const rawY = pos.getY(i); // -0.5 .. +0.5
-    const u = rawX + 0.5; // 0 .. 1
-    const v = rawY + 0.5; // 0 (root) .. 1 (tip)
+    const u = THREE.MathUtils.clamp(rawX + 0.5, 0, 1); // 0 .. 1
+    const v = THREE.MathUtils.clamp(rawY + 0.5, 0, 1); // 0 (root) .. 1 (tip)
 
     const xRel = (u - 0.5) * 2.0; // -1 .. +1
     const lx = xRel * (maxWidth * 0.5);
@@ -391,7 +396,8 @@ export function createPlant3D(
   style: PlantStyle,
   seed: number,
   photoTextures: AquariumPhotoTextures,
-  isSoftwareGl: boolean
+  isSoftwareGl: boolean,
+  waterFog?: WaterFogUniforms
 ): Plant3DHandle {
   const rand = makeSeededRand(seed);
   const group = new THREE.Group();
@@ -406,6 +412,9 @@ export function createPlant3D(
     uPhase: { value: rand() * Math.PI * 2 },
     uSpeed: { value: 1.05 + rand() * 0.55 },
     uMotionAmp: { value: 1.0 },
+    uFishPushers: {
+      value: Array.from({ length: 4 }, () => new THREE.Vector4(0, -99, 0, 0)),
+    },
   };
 
   const leafAlbedo =
@@ -440,12 +449,13 @@ export function createPlant3D(
       side: THREE.DoubleSide,
     });
 
-    leafMat.customProgramCacheKey = () => `aquarium-plant-photo-sway-${tIdx}`;
+    leafMat.customProgramCacheKey = () => `aquarium-plant-photo-sway-v2-${tIdx}`;
     leafMat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = uniforms.uTime;
       shader.uniforms.uPhase = uniforms.uPhase;
       shader.uniforms.uSpeed = uniforms.uSpeed;
       shader.uniforms.uMotionAmp = uniforms.uMotionAmp;
+      shader.uniforms.uFishPushers = uniforms.uFishPushers;
 
       shader.vertexShader = shader.vertexShader
         .replace(
@@ -454,20 +464,61 @@ export function createPlant3D(
 uniform float uTime;
 uniform float uPhase;
 uniform float uSpeed;
-uniform float uMotionAmp;`
+uniform float uMotionAmp;
+uniform vec4 uFishPushers[4];`
         )
         .replace(
           '#include <begin_vertex>',
           `#include <begin_vertex>
 float hNorm = clamp(position.y / 1.35, 0.0, 1.25);
-float flex = pow(hNorm, 1.55) * uMotionAmp;
+float flex = pow(max(0.0001, hNorm), 1.55) * uMotionAmp;
 float waveX = sin(uTime * uSpeed + uPhase - hNorm * 2.5) * 0.095
             + sin(uTime * uSpeed * 1.85 + uPhase * 1.4 - hNorm * 4.2) * 0.032;
 float waveZ = cos(uTime * uSpeed * 0.85 + uPhase * 0.7 - hNorm * 2.1) * 0.055;
 transformed.x += waveX * flex;
-transformed.z += waveZ * flex;`
+transformed.z += waveZ * flex;
+
+// Part soft leaves around swimming fish while keeping roots locked into the sandbed
+float rootAnchor = smoothstep(0.03, 0.34, position.y);
+if (rootAnchor > 0.001) {
+  vec3 bladeWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+  vec3 leafPushWorld = vec3(0.0);
+  for (int fp = 0; fp < 4; fp++) {
+    vec4 pusher = uFishPushers[fp];
+    if (pusher.w > 0.001) {
+      vec3 toLeaf = bladeWorldPos - pusher.xyz;
+      float horizDist = length(toLeaf.xz);
+      float vertDist = abs(toLeaf.y);
+      float reachXZ = pusher.w + 0.30;
+      float reachY = pusher.w * 0.95 + 0.32;
+      float wXZ = clamp(1.0 - horizDist / reachXZ, 0.0, 1.0);
+      float wY = clamp(1.0 - vertDist / reachY, 0.0, 1.0);
+      float pushW = (wXZ * wXZ) * (wY * wY);
+      if (pushW > 0.0005) {
+        vec2 pushDir = horizDist > 0.003
+          ? toLeaf.xz / horizDist
+          : normalize(vec2(sin(uPhase + float(fp) * 1.7), cos(uPhase + float(fp) * 1.7)));
+        float dispMag = pushW * (0.28 + pusher.w * 0.48) * rootAnchor;
+        leafPushWorld.xz += pushDir * dispMag;
+        leafPushWorld.y -= dispMag * 0.24;
+      }
+    }
+  }
+  float pushLen = length(leafPushWorld);
+  if (pushLen > 0.42) {
+    leafPushWorld *= 0.42 / pushLen;
+  }
+  float mScaleSq = max(0.0001, dot(modelMatrix[0].xyz, modelMatrix[0].xyz));
+  vec3 localPush = vec3(
+    dot(modelMatrix[0].xyz, leafPushWorld),
+    dot(modelMatrix[1].xyz, leafPushWorld),
+    dot(modelMatrix[2].xyz, leafPushWorld)
+  ) / mScaleSq;
+  transformed += localPush;
+}`
         );
     };
+    if (waterFog) applyWaterDepthFog(leafMat, waterFog, 1.0, 0.44);
     materials.push(leafMat);
     tintMaterials.push(leafMat);
   }

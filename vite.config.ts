@@ -19,8 +19,8 @@ export default defineConfig(() => {
           short_name: 'Acuario 3D',
           description:
             'Acuario 3D interactivo con peces tropicales, iluminación dinámica y alimentación en tiempo real.',
-          theme_color: '#061b2c',
-          background_color: '#061b2c',
+          theme_color: '#000000',
+          background_color: '#000000',
           display: 'standalone',
           orientation: 'any',
           start_url: './',

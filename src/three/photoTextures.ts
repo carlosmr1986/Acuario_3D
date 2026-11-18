@@ -48,7 +48,7 @@ function deriveNormalAndRoughness(
 ): { normalMap: THREE.CanvasTexture; roughnessMap: THREE.CanvasTexture } {
   const w = albedoCanvas.width;
   const h = albedoCanvas.height;
-  const actx = albedoCanvas.getContext('2d')!;
+  const actx = albedoCanvas.getContext('2d', { willReadFrequently: true })!;
   const srcData = actx.getImageData(0, 0, w, h).data;
 
   const lumBuf = new Float32Array(w * h);
@@ -135,7 +135,7 @@ function imageToCanvas(
   const canvas = document.createElement('canvas');
   canvas.width = sizeW;
   canvas.height = sizeH;
-  const ctx = canvas.getContext('2d')!;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
   ctx.fillStyle = fallbackColor;
   ctx.fillRect(0, 0, sizeW, sizeH);
 
@@ -165,7 +165,7 @@ function buildSwordLeafCanvas(img: HTMLImageElement | null): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
-  const ctx = canvas.getContext('2d')!;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
 
   if (img && img.naturalWidth > 0) {
     // Rotate +38deg so the diagonal midrib of the macro leaf runs vertically along center
@@ -230,7 +230,7 @@ function buildVallisneriaBladeCanvas(img: HTMLImageElement | null): HTMLCanvasEl
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
-  const ctx = canvas.getContext('2d')!;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
 
   if (img && img.naturalWidth > 0) {
     // Crop central clean section of Vallisneria blade fibers

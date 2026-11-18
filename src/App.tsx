@@ -126,7 +126,7 @@ export default function App() {
   }, []);
 
   return (
-    <div className="relative w-full h-dvh overflow-hidden bg-slate-950">
+    <div className="relative w-full h-dvh overflow-hidden bg-black">
       {/* Compact translucent top header adhering to mobile sticky height cap */}
       <header className="fixed top-0 left-0 right-0 z-20 flex items-center justify-between gap-2 px-3 sm:px-6 pt-safe pb-3 bg-gradient-to-b from-slate-950/60 via-slate-950/25 to-transparent pointer-events-none">
         <div className="pointer-events-auto flex items-center gap-3 min-w-0">
@@ -227,6 +227,7 @@ export default function App() {
           ref={aquariumRef}
           onCountsChange={handleCountsChange}
           onSelectionChange={handleSelectionChange}
+          onLightingLoaded={setLighting}
         />
       </main>
 

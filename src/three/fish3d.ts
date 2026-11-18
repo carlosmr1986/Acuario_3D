@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { FishSpecies } from '../types/aquarium';
+import { applyWaterDepthFog, type WaterFogUniforms } from './waterFogShader';
 
 export interface FishUniforms {
   uTime: { value: number };
@@ -333,7 +334,7 @@ function buildScaleMaps(maxAnisotropy: number): {
   const rctx = roughCanvas.getContext('2d')!;
   const roughImg = rctx.createImageData(w, h);
 
-  const strength = 2.6;
+  const strength = 1.55;
   for (let y = 0; y < h; y++) {
     const ym = Math.max(0, y - 1);
     const yp = Math.min(h - 1, y + 1);
@@ -354,9 +355,9 @@ function buildScaleMaps(maxAnisotropy: number): {
       normImg.data[p + 2] = clampByte((nz * invLen * 0.5 + 0.5) * 255);
       normImg.data[p + 3] = 255;
 
-      // Wet mucus gloss: tops of scale domes are glossier (lower roughness), crevices slightly rougher
+      // Natural submerged satin skin: soft sheen on scale crowns, matte crevices
       const hVal = heightBuf[y * w + x];
-      const roughByte = clampByte(78 - hVal * 34);
+      const roughByte = clampByte(205 - hVal * 48);
       roughImg.data[p] = roughByte;
       roughImg.data[p + 1] = roughByte;
       roughImg.data[p + 2] = roughByte;
@@ -647,9 +648,9 @@ uniform float uTurnBend;
 float fishLateralOffset(float x) {
   // x spans roughly -0.78 (tail tip) to +0.50 (snout)
   float tailT = clamp((0.44 - x) / 1.22, 0.0, 1.0);
-  float wave = sin(uSwimPhase - tailT * 5.4) * uSwimAmp * pow(tailT, 1.42);
+  float wave = sin(uSwimPhase - tailT * 5.4) * uSwimAmp * pow(max(0.0001, tailT), 1.42);
   float bendT = clamp((0.36 - x) / 1.14, 0.0, 1.0);
-  float turnCurve = uTurnBend * pow(bendT, 1.65);
+  float turnCurve = uTurnBend * pow(max(0.0001, bendT), 1.65);
   return wave + turnCurve;
 }`
       )
@@ -684,18 +685,18 @@ function sampleBodyProfile(t: number, species: FishSpecies): { hh: number; hw: n
 
   if (t < 0.08) {
     // Narrow caudal peduncle tapering smoothly into tail fin socket
-    const k = t / 0.08;
+    const k = THREE.MathUtils.clamp(t / 0.08, 0, 1);
     hFactor = 0.28 + 0.14 * Math.sin(k * Math.PI * 0.5);
     wFactor = 0.20 + 0.16 * k;
   } else if (t < 0.64) {
     // Full rounded mid-torso with plump dorsal arch
-    const k = (t - 0.08) / 0.56;
-    hFactor = 0.42 + 0.58 * Math.pow(Math.sin(k * Math.PI * 0.85), 0.72);
+    const k = THREE.MathUtils.clamp((t - 0.08) / 0.56, 0, 1);
+    hFactor = 0.42 + 0.58 * Math.pow(Math.max(0, Math.sin(k * Math.PI * 0.85)), 0.72);
     wFactor = 0.36 + 0.64 * Math.sin(k * Math.PI * 0.92);
     yCenter = 0.014 * Math.sin(k * Math.PI);
   } else {
     // Head & rounded reef snout
-    const k = (t - 0.64) / 0.36;
+    const k = THREE.MathUtils.clamp((t - 0.64) / 0.36, 0, 1);
     const snoutCurve = Math.sqrt(Math.max(0.0001, 1 - Math.pow(k, 1.85)));
     hFactor = 0.89 * snoutCurve;
     wFactor = 0.93 * Math.pow(snoutCurve, 0.92);
@@ -835,15 +836,16 @@ function buildCaudalGeometry(species: FishSpecies): THREE.BufferGeometry {
   for (let i = 0; i < pos.count; i++) {
     const lx = pos.getX(i); // -tailLen/2 .. +tailLen/2
     const ly = pos.getY(i); // -tailHeight/2 .. +tailHeight/2
-    const u = (lx + tailLen * 0.5) / tailLen; // 0 = tip, 1 = peduncle attachment
+    const u = THREE.MathUtils.clamp((lx + tailLen * 0.5) / tailLen, 0, 1); // 0 = tip, 1 = peduncle attachment
     const worldX = -0.46 - (1 - u) * tailLen;
     // Slight natural fan flare & subtle cup
-    const spread = 0.32 + 0.68 * Math.pow(1 - u, 0.65);
+    const spread = 0.32 + 0.68 * Math.pow(Math.max(0, 1 - u), 0.65);
     const worldY = ly * spread;
     const cupZ = Math.sin(u * Math.PI) * 0.008 * Math.sign(worldY);
     pos.setXYZ(i, worldX, worldY, cupZ);
   }
   geom.computeVertexNormals();
+  geom.computeBoundingSphere();
   return geom;
 }
 
@@ -859,7 +861,8 @@ export function createHyperrealisticFish3D(
   fishId: string,
   species: FishSpecies,
   textures: SpeciesTextureSet,
-  worldScale: number
+  worldScale: number,
+  waterFog?: WaterFogUniforms
 ): FishRig3D {
   const root = new THREE.Group();
   root.userData.fishId = fishId;
@@ -883,21 +886,22 @@ export function createHyperrealisticFish3D(
   const bodyMat = new THREE.MeshPhysicalMaterial({
     map: textures.bodyMap,
     normalMap: textures.normalMap,
-    normalScale: new THREE.Vector2(0.55, 0.55),
+    normalScale: new THREE.Vector2(0.32, 0.32),
     roughnessMap: textures.roughnessMap,
-    roughness: 0.26,
-    metalness: 0.03,
-    clearcoat: 0.85,
-    clearcoatRoughness: 0.14,
-    iridescence: 0.14,
+    roughness: 0.72,
+    metalness: 0.0,
+    clearcoat: 0.16,
+    clearcoatRoughness: 0.52,
+    iridescence: 0.04,
     iridescenceIOR: 1.33,
-    envMapIntensity: 1.05,
+    envMapIntensity: 0.34,
     transparent: false,
     opacity: 1.0,
     depthWrite: true,
     side: THREE.FrontSide,
   });
   applyFishSpineShader(bodyMat, uniforms, `fish-body-${species}`);
+  if (waterFog) applyWaterDepthFog(bodyMat, waterFog, 1.18, 0.32);
   materials.push(bodyMat);
 
   const bodyMesh = new THREE.Mesh(bodyGeom, bodyMat);
@@ -916,13 +920,15 @@ export function createHyperrealisticFish3D(
       transparent: true,
       alphaTest: 0.03,
       side: THREE.DoubleSide,
-      roughness: 0.34,
-      metalness: 0.02,
-      clearcoat: 0.55,
-      clearcoatRoughness: 0.2,
+      roughness: 0.62,
+      metalness: 0.0,
+      clearcoat: 0.10,
+      clearcoatRoughness: 0.48,
+      envMapIntensity: 0.28,
       depthWrite: false,
     });
     applyFishSpineShader(m, uniforms, key);
+    if (waterFog) applyWaterDepthFog(m, waterFog, 1.18, 0.16);
     materials.push(m);
     return m;
   };
@@ -956,10 +962,14 @@ export function createHyperrealisticFish3D(
     transparent: true,
     alphaTest: 0.03,
     side: THREE.DoubleSide,
-    roughness: 0.34,
-    clearcoat: 0.5,
+    roughness: 0.62,
+    metalness: 0.0,
+    clearcoat: 0.10,
+    clearcoatRoughness: 0.48,
+    envMapIntensity: 0.28,
     depthWrite: false,
   });
+  if (waterFog) applyWaterDepthFog(pectMat, waterFog, 1.18);
   materials.push(pectMat);
 
   const gillProfile = sampleBodyProfile(0.71, species);
@@ -1008,6 +1018,7 @@ export function createHyperrealisticFish3D(
     roughness: 0.22,
     metalness: 0.1,
   });
+  if (waterFog) applyWaterDepthFog(irisMat, waterFog, 1.18);
   const corneaMat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
     roughness: 0.04,
@@ -1019,6 +1030,7 @@ export function createHyperrealisticFish3D(
     reflectivity: 1.0,
     depthWrite: false,
   });
+  if (waterFog) applyWaterDepthFog(corneaMat, waterFog, 1.18);
   materials.push(irisMat, corneaMat);
 
   for (const side of [1, -1] as const) {
