@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import type { AquariumBackgroundId } from '../types/aquarium';
 import type { AquariumPhotoTextures } from './photoTextures';
 import { applyWaterDepthFog, type WaterFogUniforms } from './waterFogShader';
 
@@ -8,8 +9,27 @@ export const TANK_D = 3.0;
 export const TANK_SAND_BASE_Y = -1.16;
 export const TANK_WATER_TOP_Y = 1.32;
 
+export interface TankSizeInput {
+  width: number;
+  height: number;
+  depth: number;
+}
+
+export function computeTankVerticalBounds(height: number): {
+  sandBaseY: number;
+  waterTopY: number;
+} {
+  return {
+    sandBaseY: 0.05 - height * 0.5 + 0.39,
+    waterTopY: 0.05 + height * 0.5 - 0.33,
+  };
+}
+
 export interface Tank3DHandle {
   group: THREE.Group;
+  dims: TankSizeInput;
+  sandBaseY: number;
+  waterTopY: number;
   uniforms: {
     uTime: { value: number };
     uMotionAmp: { value: number };
@@ -18,6 +38,7 @@ export interface Tank3DHandle {
   };
   airstoneTop: THREE.Vector3;
   triggerSurfaceWave: (x: number, z: number, strength?: number) => void;
+  setBackground: (id: AquariumBackgroundId, photoTextures: AquariumPhotoTextures) => void;
   geometries: THREE.BufferGeometry[];
   materials: THREE.Material[];
 }
@@ -49,9 +70,16 @@ function sandNoise2D(x: number, z: number): number {
  * so the substrate contour—including against all glass walls—looks irregular and natural.
  * Every 3D rock, plant, and pebble uses this to sit flush on the substrate.
  */
-export function sandHeightAt(x: number, z: number): number {
-  const nx = x / (TANK_W * 0.5);
-  const nz = z / (TANK_D * 0.5);
+export function sandHeightAt(
+  x: number,
+  z: number,
+  dims?: { width: number; depth: number; sandBaseY?: number }
+): number {
+  const tankW = dims?.width ?? TANK_W;
+  const tankD = dims?.depth ?? TANK_D;
+  const baseY = dims?.sandBaseY ?? TANK_SAND_BASE_Y;
+  const nx = x / (tankW * 0.5);
+  const nz = z / (tankD * 0.5);
   const warpX = x + sandNoise2D(x * 0.55 + 3.1, z * 0.55 - 1.7) * 0.42;
   const warpZ = z + sandNoise2D(x * 0.55 - 2.4, z * 0.55 + 4.8) * 0.36;
 
@@ -60,21 +88,46 @@ export function sandHeightAt(x: number, z: number): number {
   const fine = sandNoise2D(x * 5.2 + 7.1, z * 5.4 - 3.3) * 0.014;
   const ripple = Math.sin(warpX * 2.6 + warpZ * 1.4) * 0.016;
   const slope = Math.max(0, -nz) * 0.078 + Math.pow(nx * 0.52, 2) * 0.04;
-  return TANK_SAND_BASE_Y + macro + medium + fine + ripple + slope;
+  return baseY + macro + medium + fine + ripple + slope;
+}
+
+function getBackdropVisualStyle(id: AquariumBackgroundId): {
+  tintHex: number;
+  emissiveHex: number;
+  emissiveIntensity: number;
+} {
+  switch (id) {
+    case 'frosted':
+      return { tintHex: 0xaad4e8, emissiveHex: 0xc8eeff, emissiveIntensity: 0.44 };
+    case 'slate':
+      return { tintHex: 0x454f5b, emissiveHex: 0x0b121b, emissiveIntensity: 0.08 };
+    case 'reef':
+      return { tintHex: 0x627c8c, emissiveHex: 0x094c6e, emissiveIntensity: 0.14 };
+    case 'amazon':
+      return { tintHex: 0x607a68, emissiveHex: 0x0b2d20, emissiveIntensity: 0.12 };
+    case 'abyss':
+      return { tintHex: 0x4e6c8e, emissiveHex: 0x062244, emissiveIntensity: 0.12 };
+    case 'natural':
+    default:
+      return { tintHex: 0x708596, emissiveHex: 0x083452, emissiveIntensity: 0.08 };
+  }
 }
 
 /**
- * Builds the photorealistic 3D Aquarium Tank:
- * - Sculpted 3D sandbed with macro quartz sand photo, Sobel normal/roughness, glass-edge stratification & GPU caustics
- * - Instanced natural rock-textured pebbles seated flush on the sand dunes
- * - Soft out-of-focus underwater backdrop depth behind the rear glass
- * - Animated 3D water surface meniscus with real concentric ripple normals & rimless 3D glass walls
+ * Builds the photorealistic 3D Aquarium Tank with customizable dimensions and backdrop theme.
  */
 export function createAquariumTank3D(
+  dims: TankSizeInput,
   photoTextures: AquariumPhotoTextures,
+  backgroundId: AquariumBackgroundId,
   isSoftwareGl: boolean,
   waterFog?: WaterFogUniforms
 ): Tank3DHandle {
+  const tankW = dims.width;
+  const tankH = dims.height;
+  const tankD = dims.depth;
+  const { sandBaseY, waterTopY } = computeTankVerticalBounds(tankH);
+
   const group = new THREE.Group();
   const rippleSlots: THREE.Vector4[] = Array.from(
     { length: 8 },
@@ -90,8 +143,8 @@ export function createAquariumTank3D(
   };
 
   const triggerSurfaceWave = (x: number, z: number, strength = 0.75) => {
-    const clampedX = THREE.MathUtils.clamp(x, -TANK_W * 0.48, TANK_W * 0.48);
-    const clampedZ = THREE.MathUtils.clamp(z, -TANK_D * 0.48, TANK_D * 0.48);
+    const clampedX = THREE.MathUtils.clamp(x, -tankW * 0.48, tankW * 0.48);
+    const clampedZ = THREE.MathUtils.clamp(z, -tankD * 0.48, tankD * 0.48);
     const clampedStrength = THREE.MathUtils.clamp(strength, 0.15, 1.5);
     rippleSlots[nextRippleSlot].set(
       clampedX,
@@ -107,21 +160,35 @@ export function createAquariumTank3D(
 
   // 1. Photorealistic 3D Sculpted Sandbed Substrate with Irregular Glass-Edge Cross-Section
   const sandThick = 0.46;
-  const sandW = TANK_W - 0.04;
-  const sandD = TANK_D - 0.04;
-  const sandGeom = new THREE.BoxGeometry(sandW, sandThick, sandD, 96, 6, 54);
+  const sandW = tankW - 0.04;
+  const sandD = tankD - 0.04;
+  const segX = Math.max(64, Math.round(96 * (tankW / TANK_W)));
+  const segZ = Math.max(38, Math.round(54 * (tankD / TANK_D)));
+  const sandGeom = new THREE.BoxGeometry(sandW, sandThick, sandD, segX, 6, segZ);
   const posAttr = sandGeom.attributes.position;
   const normAttr = sandGeom.attributes.normal;
+  const uvAttr = sandGeom.attributes.uv;
+  const uvScaleX = tankW / TANK_W;
+  const uvScaleZ = tankD / TANK_D;
   const sandColors = new Float32Array(posAttr.count * 3);
-  const sandBaseBottomY = TANK_SAND_BASE_Y - sandThick * 0.65;
+  const sandBaseBottomY = sandBaseY - sandThick * 0.65;
 
   for (let i = 0; i < posAttr.count; i++) {
     const vx = posAttr.getX(i);
     const vy = posAttr.getY(i);
     const vz = posAttr.getZ(i);
     const ny = normAttr.getY(i);
-    const topY = sandHeightAt(vx, vz);
+    const topY = sandHeightAt(vx, vz, { width: tankW, depth: tankD, sandBaseY });
     const depthFrac = THREE.MathUtils.clamp((sandThick * 0.5 - vy) / sandThick, 0, 1);
+
+    // Keep physical sand grain scale consistent when resizing tank
+    if (Math.abs(ny) > 0.5) {
+      uvAttr.setXY(i, uvAttr.getX(i) * uvScaleX, uvAttr.getY(i) * uvScaleZ);
+    } else if (Math.abs(normAttr.getZ(i)) > 0.5) {
+      uvAttr.setXY(i, uvAttr.getX(i) * uvScaleX, uvAttr.getY(i));
+    } else {
+      uvAttr.setXY(i, uvAttr.getX(i) * uvScaleZ, uvAttr.getY(i));
+    }
 
     // Subtle wavy stratification along the glass-facing cross-section walls
     const strataWave =
@@ -285,7 +352,10 @@ gl_FragColor.rgb += vec3(0.14, 0.28, 0.34) * caustic * topMask * 0.78 * uCaustic
   if (waterFog) applyWaterDepthFog(pebbleMat, waterFog, 0.88, 0.55);
   materials.push(pebbleMat);
 
-  const pebbleCount = 132;
+  const pebbleCount = Math.max(
+    84,
+    Math.round(132 * ((tankW * tankD) / (TANK_W * TANK_D)))
+  );
   const pebbles = new THREE.InstancedMesh(pebbleGeom, pebbleMat, pebbleCount);
   const dummy = new THREE.Object3D();
   const color = new THREE.Color();
@@ -297,24 +367,27 @@ gl_FragColor.rgb += vec3(0.14, 0.28, 0.34) * caustic * topMask * 0.78 * uCaustic
     return (pSeed - 1) / 2147483646;
   };
 
+  const edgeThreshold = Math.round(pebbleCount * 0.7);
   for (let i = 0; i < pebbleCount; i++) {
     // Cluster ~30% of smaller gravel pebbles near glass perimeter to break up edge regularity
     let px: number;
     let pz: number;
-    const isEdgeGravel = i >= 92;
+    const isEdgeGravel = i >= edgeThreshold;
     if (isEdgeGravel) {
       if (pRand() < 0.6) {
-        px = (pRand() - 0.5) * (TANK_W - 0.24);
-        pz = (pRand() < 0.7 ? 1 : -1) * (TANK_D * 0.5 - 0.08 - pRand() * 0.24);
+        px = (pRand() - 0.5) * (tankW - 0.24);
+        pz = (pRand() < 0.7 ? 1 : -1) * (tankD * 0.5 - 0.08 - pRand() * 0.24);
       } else {
-        px = (pRand() < 0.5 ? 1 : -1) * (TANK_W * 0.5 - 0.08 - pRand() * 0.24);
-        pz = (pRand() - 0.5) * (TANK_D - 0.24);
+        px = (pRand() < 0.5 ? 1 : -1) * (tankW * 0.5 - 0.08 - pRand() * 0.24);
+        pz = (pRand() - 0.5) * (tankD - 0.24);
       }
     } else {
-      px = (pRand() - 0.5) * (TANK_W - 0.28);
-      pz = (pRand() - 0.5) * (TANK_D - 0.28);
+      px = (pRand() - 0.5) * (tankW - 0.28);
+      pz = (pRand() - 0.5) * (tankD - 0.28);
     }
-    const py = sandHeightAt(px, pz) + (isEdgeGravel ? 0.001 : 0.003);
+    const py =
+      sandHeightAt(px, pz, { width: tankW, depth: tankD, sandBaseY }) +
+      (isEdgeGravel ? 0.001 : 0.003);
     const sc = isEdgeGravel ? 0.26 + pRand() * 0.55 : 0.42 + pRand() * 1.18;
     dummy.position.set(px, py, pz);
     dummy.rotation.set(pRand() * 0.28, pRand() * Math.PI * 2, pRand() * 0.28);
@@ -333,7 +406,7 @@ gl_FragColor.rgb += vec3(0.14, 0.28, 0.34) * caustic * topMask * 0.78 * uCaustic
   group.add(pebbles);
 
   // 3. Animated 3D Water Surface Meniscus with Interactive Concentric Wave Normals
-  const waterGeom = new THREE.PlaneGeometry(TANK_W - 0.04, TANK_D - 0.04, 72, 42);
+  const waterGeom = new THREE.PlaneGeometry(tankW - 0.04, tankD - 0.04, 72, 42);
   waterGeom.rotateX(-Math.PI * 0.5);
   geometries.push(waterGeom);
 
@@ -476,7 +549,7 @@ if (!gl_FrontFacing) {
   materials.push(waterMat);
 
   const waterSurface = new THREE.Mesh(waterGeom, waterMat);
-  waterSurface.position.set(0, TANK_WATER_TOP_Y, 0);
+  waterSurface.position.set(0, waterTopY, 0);
   waterSurface.renderOrder = 45;
   group.add(waterSurface);
 
@@ -524,39 +597,40 @@ void main() {
   });
   materials.push(meniscusMat);
 
-  const frontMeniscusGeom = new THREE.PlaneGeometry(TANK_W - 0.04, meniscusHeight, 48, 1);
-  const sideMeniscusGeom = new THREE.PlaneGeometry(TANK_D - 0.04, meniscusHeight, 28, 1);
+  const frontMeniscusGeom = new THREE.PlaneGeometry(tankW - 0.04, meniscusHeight, 48, 1);
+  const sideMeniscusGeom = new THREE.PlaneGeometry(tankD - 0.04, meniscusHeight, 28, 1);
   geometries.push(frontMeniscusGeom, sideMeniscusGeom);
 
   const frontMeniscus = new THREE.Mesh(frontMeniscusGeom, meniscusMat);
-  frontMeniscus.position.set(0, TANK_WATER_TOP_Y - 0.005, TANK_D * 0.5 - 0.012);
+  frontMeniscus.position.set(0, waterTopY - 0.005, tankD * 0.5 - 0.012);
   frontMeniscus.renderOrder = 57;
 
   const leftMeniscus = new THREE.Mesh(sideMeniscusGeom, meniscusMat);
-  leftMeniscus.position.set(-TANK_W * 0.5 + 0.012, TANK_WATER_TOP_Y - 0.005, 0);
+  leftMeniscus.position.set(-tankW * 0.5 + 0.012, waterTopY - 0.005, 0);
   leftMeniscus.rotation.y = Math.PI * 0.5;
   leftMeniscus.renderOrder = 56;
 
   const rightMeniscus = new THREE.Mesh(sideMeniscusGeom, meniscusMat);
-  rightMeniscus.position.set(TANK_W * 0.5 - 0.012, TANK_WATER_TOP_Y - 0.005, 0);
+  rightMeniscus.position.set(tankW * 0.5 - 0.012, waterTopY - 0.005, 0);
   rightMeniscus.rotation.y = -Math.PI * 0.5;
   rightMeniscus.renderOrder = 56;
 
   group.add(frontMeniscus, leftMeniscus, rightMeniscus);
 
   // 3c. Discreet Corner Porous Basalt Air-Stone & Slim Airline in Back-Right Corner
-  const airX = TANK_W * 0.5 - 0.42;
-  const airZ = -TANK_D * 0.5 + 0.36;
-  const airFloorY = sandHeightAt(airX, airZ);
+  const airX = tankW * 0.5 - Math.min(0.42, tankW * 0.1);
+  const airZ = -tankD * 0.5 + Math.min(0.36, tankD * 0.14);
+  const airFloorY = sandHeightAt(airX, airZ, { width: tankW, depth: tankD, sandBaseY });
   const airstoneTop = new THREE.Vector3(airX, airFloorY + 0.088, airZ);
 
   const stoneBodyGeom = new THREE.CylinderGeometry(0.052, 0.064, 0.078, 18);
   const collarGeom = new THREE.CylinderGeometry(0.018, 0.022, 0.016, 12);
+  const midTubeY = (airFloorY + waterTopY) * 0.5 - 0.25;
   const tubeCurve = new THREE.CatmullRomCurve3([
     new THREE.Vector3(airX, airFloorY + 0.075, airZ),
     new THREE.Vector3(airX + 0.14, airFloorY + 0.12, airZ - 0.14),
-    new THREE.Vector3(TANK_W * 0.5 - 0.06, -0.35, -TANK_D * 0.5 + 0.06),
-    new THREE.Vector3(TANK_W * 0.5 - 0.05, TANK_WATER_TOP_Y + 0.18, -TANK_D * 0.5 + 0.05),
+    new THREE.Vector3(tankW * 0.5 - 0.06, midTubeY, -tankD * 0.5 + 0.06),
+    new THREE.Vector3(tankW * 0.5 - 0.05, waterTopY + 0.18, -tankD * 0.5 + 0.05),
   ]);
   const tubeGeom = new THREE.TubeGeometry(tubeCurve, 24, 0.0085, 8, false);
   geometries.push(stoneBodyGeom, collarGeom, tubeGeom);
@@ -600,24 +674,42 @@ void main() {
   group.add(stoneMesh, collarMesh, tubeMesh);
 
   // 4. Soft Out-of-Focus Underwater Aquascape Backdrop Behind Rear Glass
-  const backGeom = new THREE.PlaneGeometry(TANK_W, TANK_H);
+  const backGeom = new THREE.PlaneGeometry(tankW, tankH);
   geometries.push(backGeom);
+  const initBackdropTex =
+    photoTextures.backdrops[backgroundId] ?? photoTextures.backdropMap ?? null;
+  const initStyle = getBackdropVisualStyle(backgroundId);
   const backMat = new THREE.MeshStandardMaterial({
-    map: photoTextures.backdropMap ?? undefined,
-    color: photoTextures.backdropMap ? 0xcbeeff : 0x0b527e,
-    roughness: 0.55,
-    metalness: 0.02,
+    map: initBackdropTex ?? undefined,
+    emissiveMap: initBackdropTex ?? undefined,
+    color: initStyle.tintHex,
+    emissive: new THREE.Color(initStyle.emissiveHex),
+    emissiveIntensity: initStyle.emissiveIntensity,
+    roughness: 0.94,
+    metalness: 0.0,
+    envMapIntensity: 0.08,
     side: THREE.DoubleSide,
   });
   if (waterFog) applyWaterDepthFog(backMat, waterFog, 0.48);
   materials.push(backMat);
   const backGlass = new THREE.Mesh(backGeom, backMat);
-  backGlass.position.set(0, 0.05, -TANK_D * 0.5);
+  backGlass.position.set(0, 0.05, -tankD * 0.5);
   group.add(backGlass);
 
+  const setBackground = (id: AquariumBackgroundId, nextPhotos: AquariumPhotoTextures) => {
+    const tex = nextPhotos.backdrops[id] ?? nextPhotos.backdropMap ?? null;
+    const style = getBackdropVisualStyle(id);
+    backMat.map = tex;
+    backMat.emissiveMap = tex;
+    backMat.color.setHex(style.tintHex);
+    backMat.emissive.setHex(style.emissiveHex);
+    backMat.emissiveIntensity = style.emissiveIntensity;
+    backMat.needsUpdate = true;
+  };
+
   // 5. Left, Right & Front Ultra-Clear Glass Walls (subtle Fresnel reflection & clear view)
-  const sideGlassGeom = new THREE.PlaneGeometry(TANK_D, TANK_H);
-  const frontGlassGeom = new THREE.PlaneGeometry(TANK_W, TANK_H);
+  const sideGlassGeom = new THREE.PlaneGeometry(tankD, tankH);
+  const frontGlassGeom = new THREE.PlaneGeometry(tankW, tankH);
   geometries.push(sideGlassGeom, frontGlassGeom);
 
   const glassWallMat = new THREE.MeshPhysicalMaterial({
@@ -636,17 +728,17 @@ void main() {
   materials.push(glassWallMat);
 
   const leftGlass = new THREE.Mesh(sideGlassGeom, glassWallMat);
-  leftGlass.position.set(-TANK_W * 0.5, 0.05, 0);
+  leftGlass.position.set(-tankW * 0.5, 0.05, 0);
   leftGlass.rotation.y = Math.PI * 0.5;
   leftGlass.renderOrder = 55;
 
   const rightGlass = new THREE.Mesh(sideGlassGeom, glassWallMat);
-  rightGlass.position.set(TANK_W * 0.5, 0.05, 0);
+  rightGlass.position.set(tankW * 0.5, 0.05, 0);
   rightGlass.rotation.y = -Math.PI * 0.5;
   rightGlass.renderOrder = 55;
 
   const frontGlass = new THREE.Mesh(frontGlassGeom, glassWallMat);
-  frontGlass.position.set(0, 0.05, TANK_D * 0.5);
+  frontGlass.position.set(0, 0.05, tankD * 0.5);
   frontGlass.renderOrder = 58;
 
   group.add(leftGlass, rightGlass, frontGlass);
@@ -664,16 +756,16 @@ void main() {
   });
   materials.push(bevelMat);
 
-  const cornerBevelGeom = new THREE.BoxGeometry(0.022, TANK_H, 0.022);
-  const frontRimGeom = new THREE.BoxGeometry(TANK_W + 0.02, 0.02, 0.022);
-  const sideRimGeom = new THREE.BoxGeometry(0.022, 0.02, TANK_D);
+  const cornerBevelGeom = new THREE.BoxGeometry(0.022, tankH, 0.022);
+  const frontRimGeom = new THREE.BoxGeometry(tankW + 0.02, 0.02, 0.022);
+  const sideRimGeom = new THREE.BoxGeometry(0.022, 0.02, tankD);
   geometries.push(cornerBevelGeom, frontRimGeom, sideRimGeom);
 
   const corners = [
-    [-TANK_W * 0.5, -TANK_D * 0.5],
-    [TANK_W * 0.5, -TANK_D * 0.5],
-    [-TANK_W * 0.5, TANK_D * 0.5],
-    [TANK_W * 0.5, TANK_D * 0.5],
+    [-tankW * 0.5, -tankD * 0.5],
+    [tankW * 0.5, -tankD * 0.5],
+    [-tankW * 0.5, tankD * 0.5],
+    [tankW * 0.5, tankD * 0.5],
   ];
   for (const [cx, cz] of corners) {
     const post = new THREE.Mesh(cornerBevelGeom, bevelMat);
@@ -682,26 +774,26 @@ void main() {
     group.add(post);
   }
 
-  const topY = 0.05 + TANK_H * 0.5;
+  const topY = 0.05 + tankH * 0.5;
   const frontTopRim = new THREE.Mesh(frontRimGeom, bevelMat);
-  frontTopRim.position.set(0, topY, TANK_D * 0.5);
+  frontTopRim.position.set(0, topY, tankD * 0.5);
   frontTopRim.renderOrder = 59;
 
   const backTopRim = new THREE.Mesh(frontRimGeom, bevelMat);
-  backTopRim.position.set(0, topY, -TANK_D * 0.5);
+  backTopRim.position.set(0, topY, -tankD * 0.5);
   backTopRim.renderOrder = 59;
 
   const leftTopRim = new THREE.Mesh(sideRimGeom, bevelMat);
-  leftTopRim.position.set(-TANK_W * 0.5, topY, 0);
+  leftTopRim.position.set(-tankW * 0.5, topY, 0);
   leftTopRim.renderOrder = 59;
 
   const rightTopRim = new THREE.Mesh(sideRimGeom, bevelMat);
-  rightTopRim.position.set(TANK_W * 0.5, topY, 0);
+  rightTopRim.position.set(tankW * 0.5, topY, 0);
   rightTopRim.renderOrder = 59;
 
   group.add(frontTopRim, backTopRim, leftTopRim, rightTopRim);
 
-  const tempOutlineBox = new THREE.BoxGeometry(TANK_W, TANK_H, TANK_D);
+  const tempOutlineBox = new THREE.BoxGeometry(tankW, tankH, tankD);
   const tankOutlineGeom = new THREE.EdgesGeometry(tempOutlineBox);
   tempOutlineBox.dispose();
   geometries.push(tankOutlineGeom);
@@ -715,7 +807,7 @@ void main() {
   tankEdges.position.set(0, 0.05, 0);
   group.add(tankEdges);
 
-  const plinthGeom = new THREE.BoxGeometry(TANK_W + 0.14, 0.18, TANK_D + 0.14);
+  const plinthGeom = new THREE.BoxGeometry(tankW + 0.14, 0.18, tankD + 0.14);
   geometries.push(plinthGeom);
   const plinthMat = new THREE.MeshStandardMaterial({
     color: 0x0f172a,
@@ -724,14 +816,18 @@ void main() {
   });
   materials.push(plinthMat);
   const plinth = new THREE.Mesh(plinthGeom, plinthMat);
-  plinth.position.set(0, -TANK_H * 0.5 + 0.05 - 0.09, 0);
+  plinth.position.set(0, -tankH * 0.5 + 0.05 - 0.09, 0);
   group.add(plinth);
 
   return {
     group,
+    dims: { width: tankW, height: tankH, depth: tankD },
+    sandBaseY,
+    waterTopY,
     uniforms,
     airstoneTop,
     triggerSurfaceWave,
+    setBackground,
     geometries,
     materials,
   };

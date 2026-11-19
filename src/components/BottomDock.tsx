@@ -50,7 +50,7 @@ export function BottomDock({
             className="w-5 h-5 sm:w-[18px] sm:h-[18px] text-sky-100 shrink-0 transition-transform duration-150 group-active:scale-110"
             aria-hidden="true"
           />
-          <span>Añadir Pez</span>
+          <span>Añadir Goldfish</span>
         </button>
       </div>
     </nav>

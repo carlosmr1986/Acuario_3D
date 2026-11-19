@@ -59,6 +59,9 @@ export interface FishKinematicInput {
   speedNorm: number; // ~0.2 .. 2.6
   yawRate: number; // signed rad/s
   pitchAngle: number; // rad
+  headPitch: number; // independent cranial pitch (rad, + = snout up, - = snout down)
+  headYaw: number; // independent cranial yaw (rad, + = snout left/-Z, - = snout right/+Z)
+  pitchArch: number; // dorsoventral spine arch (rad, + = upward climb curve, - = downward dive arch)
   chompRatio: number; // 0..1
   motionScale: number; // 0.25 (reduced motion) or 1.0
   turnBendSmooth: number; // smoothed signed turn bend
@@ -92,6 +95,14 @@ const SPECIES_PALETTES: Record<
     aspectWidth: 0.19,
   },
   goldfish: {
+    primary: '#f97316',
+    secondary: '#fff8ef',
+    trim: '#fde68a',
+    iris: '#fbbf24',
+    aspectHeight: 0.45,
+    aspectWidth: 0.24,
+  },
+  koi: {
     primary: '#f97316',
     secondary: '#fff8ef',
     trim: '#fde68a',
@@ -338,6 +349,21 @@ function buildBodyTexture(
               b = clampByte(b * (1 - whiteMask) + pearl * 0.96 * whiteMask);
             }
           }
+
+          // Subtle curved gill-cover rim shadow + dark oral mouth cleft so breathing jaw & gills read crisply
+          const gillCurveU = 0.732 + Math.pow(Math.max(-0.45, Math.min(0.45, vNorm - 0.48)), 2) * 0.14;
+          const gillEdge = Math.exp(-Math.pow((u - gillCurveU) / 0.013, 2));
+          const gillVert = Math.max(0, 1 - Math.abs(vNorm - 0.54) / 0.28);
+          const gillShade = 1 - gillEdge * gillVert * 0.22;
+
+          const mouthU = Math.max(0, (u - 0.905) / 0.095);
+          const mouthV = Math.exp(-Math.pow((vNorm - 0.515) / 0.068, 2));
+          const mouthShade = 1 - mouthU * mouthV * 0.58;
+
+          const featureShade = gillShade * mouthShade;
+          r = clampByte(r * featureShade);
+          g = clampByte(g * featureShade);
+          b = clampByte(b * featureShade);
 
           outData[dp] = r;
           outData[dp + 1] = g;
@@ -837,7 +863,7 @@ function sampleBodyProfile(
     yCenter = -0.025 * Math.pow(k, 1.4);
   }
 
-  const gillDelta = Math.exp(-Math.pow((t - 0.72) / 0.032, 2)) * 0.055;
+  const gillDelta = Math.exp(-Math.pow((t - 0.72) / 0.044, 2)) * 0.040;
   wFactor += gillDelta;
 
   return {
@@ -861,23 +887,30 @@ function sampleBodyProfile(
 // 14..16: pectRBase, pectRMid, pectRTip
 // 17..18: pelvicLBase, pelvicLTip
 // 19..20: pelvicRBase, pelvicRTip
-const AXIAL_BONE_X = [0.28, 0.13, -0.02, -0.17, -0.32, -0.47, -0.60, -0.74];
+const AXIAL_BONE_X = [0.21, 0.13, -0.02, -0.17, -0.32, -0.47, -0.60, -0.74];
 
 /**
  * Computes smooth 4-bone Gaussian skinning weights along the axial vertebral chain [0..7],
- * guaranteeing seamless elastic curvature across vertebrae without kinks.
+ * guaranteeing seamless elastic curvature across vertebrae while keeping the rigid cranium
+ * (eye sockets & snout) locked to spineCranium so eyeballs never drift when the head nods.
  */
 function computeAxialSkinWeights(
   x: number,
   maxBoneIdx: number,
-  sigma = 0.145
+  sigma = 0.128
 ): { indices: [number, number, number, number]; weights: [number, number, number, number] } {
+  const skullLock = THREE.MathUtils.smoothstep(x, 0.02, 0.265);
   const candidates: { idx: number; w: number }[] = [];
   for (let b = 0; b <= maxBoneIdx; b++) {
     const dx = x - AXIAL_BONE_X[b];
-    // Anterior to cranium center: anchor firmly onto cranium
+    // Anterior to cranium joint: anchor firmly onto cranium
     const dist = b === 0 && x > AXIAL_BONE_X[0] ? 0 : dx;
-    const w = Math.exp(-(dist * dist) / (2 * sigma * sigma));
+    let w = Math.exp(-(dist * dist) / (2 * sigma * sigma));
+    if (b === 0) {
+      w = THREE.MathUtils.lerp(w, 1.0, skullLock);
+    } else {
+      w *= 1.0 - skullLock;
+    }
     candidates.push({ idx: b, w });
   }
   candidates.sort((a, b) => b.w - a.w);
@@ -914,7 +947,7 @@ function buildBodyGeometry(species: FishSpecies): THREE.BufferGeometry {
     const x = -0.5 + t;
     const { hh, hw, yCenter } = sampleBodyProfile(t, species);
 
-    const axial = computeAxialSkinWeights(x, 5, 0.135);
+    const axial = computeAxialSkinWeights(x, 5, 0.128);
 
     for (let j = 0; j <= radialSegs; j++) {
       const theta = (j / radialSegs) * Math.PI * 2;
@@ -927,7 +960,12 @@ function buildBodyGeometry(species: FishSpecies): THREE.BufferGeometry {
       const eyeBoss = eyeSocketDist < 1 ? (1 - eyeSocketDist * eyeSocketDist) * 0.009 : 0;
       const z = (hw * ridgePinch + eyeBoss) * cosT;
 
-      positions.push(x, y, z);
+      // Subtle oral cleft indentation along front snout parting so jaw drop forms a crisp open mouth
+      const mouthPartU = THREE.MathUtils.smoothstep(t, 0.915, 0.995);
+      const mouthPartV = Math.exp(-Math.pow((sinT + 0.04) / 0.16, 2));
+      const mouthCleftX = -mouthPartU * mouthPartV * 0.008;
+
+      positions.push(x + mouthCleftX, y, z);
       normals.push(0, sinT, cosT);
       uvs.push(t, 0.5 + 0.47 * sinT);
       finInfo.push(0, 0, 0, 0);
@@ -936,18 +974,18 @@ function buildBodyGeometry(species: FishSpecies): THREE.BufferGeometry {
       const bIdx: [number, number, number, number] = [...axial.indices];
       const bW: [number, number, number, number] = [...axial.weights];
 
-      // Lower jaw respiratory articulation near snout underside (t > 0.88, sinT < -0.1)
+      // Lower jaw respiratory & feeding articulation (t > 0.83, sinT < +0.02 -> eye sockets stay 100% locked)
       const jawWeightRaw =
-        THREE.MathUtils.smoothstep(t, 0.86, 0.96) *
-        THREE.MathUtils.smoothstep(-sinT, 0.05, 0.65);
-      // Gill operculum respiratory flare on flanks near t = 0.70..0.77
-      const gillXMask = Math.exp(-Math.pow((t - 0.72) / 0.036, 2));
-      const gillYMask = Math.max(0, 1 - Math.abs(sinT + 0.1) / 0.72);
-      const gillZMask = THREE.MathUtils.smoothstep(Math.abs(cosT), 0.45, 0.9);
-      const gillWeightRaw = gillXMask * gillYMask * gillZMask * 0.52;
+        THREE.MathUtils.smoothstep(t, 0.83, 0.93) *
+        THREE.MathUtils.smoothstep(-sinT, -0.02, 0.50);
+      // Gill operculum respiratory flare on flanks inside rigid cranial cap (t = 0.72..0.79)
+      const gillXMask = Math.exp(-Math.pow((t - 0.755) / 0.038, 2));
+      const gillYMask = Math.max(0, 1 - Math.abs(sinT + 0.08) / 0.72);
+      const gillZMask = THREE.MathUtils.smoothstep(Math.abs(cosT), 0.34, 0.88);
+      const gillWeightRaw = gillXMask * gillYMask * gillZMask * 0.58;
 
       if (jawWeightRaw > 0.02) {
-        const jw = Math.min(0.75, jawWeightRaw * 0.75);
+        const jw = Math.min(0.86, jawWeightRaw * 0.86);
         bIdx[0] = 0;
         bW[0] = 1 - jw;
         bIdx[1] = 8; // jaw
@@ -956,17 +994,16 @@ function buildBodyGeometry(species: FishSpecies): THREE.BufferGeometry {
         bW[2] = 0;
         bIdx[3] = 2;
         bW[3] = 0;
-      } else if (gillWeightRaw > 0.02) {
-        const gw = Math.min(0.55, gillWeightRaw);
+      } else if (gillWeightRaw > 0.01) {
+        const gw = Math.min(0.56, gillWeightRaw);
         const opIdx = cosT >= 0 ? 9 : 10;
-        bIdx[0] = 0;
-        bW[0] = (1 - gw) * 0.85;
-        bIdx[1] = 1;
-        bW[1] = (1 - gw) * 0.15;
-        bIdx[2] = opIdx;
-        bW[2] = gw;
-        bIdx[3] = 2;
-        bW[3] = 0;
+        const sum3 = Math.max(1e-4, bW[0] + bW[1] + bW[2]);
+        const scale = (1 - gw) / sum3;
+        bW[0] *= scale;
+        bW[1] *= scale;
+        bW[2] *= scale;
+        bIdx[3] = opIdx;
+        bW[3] = gw;
       }
 
       skinIndices.push(bIdx[0], bIdx[1], bIdx[2], bIdx[3]);
@@ -1077,7 +1114,7 @@ function buildUnifiedFinsGeometry(species: FishSpecies): THREE.BufferGeometry {
       const span = i / cols; // 0 = peduncle root, 1 = trailing margin
       const x = -0.45 - span * tailLen;
       const spread = 0.28 + 0.72 * Math.pow(span, 0.66);
-      const axial = computeAxialSkinWeights(x, 7, 0.125);
+      const axial = computeAxialSkinWeights(x, 7, 0.128);
 
       for (let j = 0; j <= rows; j++) {
         const lobeNorm = j / rows; // 0 = bottom, 1 = top
@@ -1107,7 +1144,7 @@ function buildUnifiedFinsGeometry(species: FishSpecies): THREE.BufferGeometry {
       const prof = sampleBodyProfile(t, species);
       const spineY = prof.yCenter + prof.hh * 0.88;
       const finReach = maxHeight * (0.62 + 0.38 * Math.sin(chordU * Math.PI));
-      const axial = computeAxialSkinWeights(x, 5, 0.135);
+      const axial = computeAxialSkinWeights(x, 5, 0.128);
 
       for (let j = 0; j <= rows; j++) {
         const spanV = j / rows; // 0 = spine root -> 1 = outer crest
@@ -1146,7 +1183,7 @@ function buildUnifiedFinsGeometry(species: FishSpecies): THREE.BufferGeometry {
       const prof = sampleBodyProfile(t, species);
       const bellyY = prof.yCenter - prof.hh * 0.86;
       const finDrop = dropHeight * Math.sin((0.15 + chordU * 0.75) * Math.PI);
-      const axial = computeAxialSkinWeights(x, 5, 0.135);
+      const axial = computeAxialSkinWeights(x, 5, 0.128);
 
       for (let j = 0; j <= rows; j++) {
         const spanV = j / rows; // 0 = belly root -> 1 = lower tip
@@ -1193,16 +1230,16 @@ function buildUnifiedFinsGeometry(species: FishSpecies): THREE.BufferGeometry {
       // Tight muscular socket at span=0 fanning smoothly out to paddle chord
       const halfChord = (0.18 + 0.82 * Math.sin(Math.min(1, span * 0.92 + 0.15) * Math.PI * 0.62)) * (pectHeight * 0.5);
 
-      // Smooth 4-bone skinning weights: shoulder socket welded to cranium (0) -> base -> mid -> tip
-      let wCran = Math.max(0, 1 - span / 0.16);
-      wCran = wCran * wCran * (3 - 2 * wCran) * 0.72;
-      const wBase = Math.exp(-Math.pow((span - 0.22) / 0.22, 2)) * (1 - wCran);
+      // Smooth 4-bone skinning weights: shoulder socket welded to thoracic spine1 (1) -> base -> mid -> tip
+      let wShoulder = Math.max(0, 1 - span / 0.16);
+      wShoulder = wShoulder * wShoulder * (3 - 2 * wShoulder) * 0.72;
+      const wBase = Math.exp(-Math.pow((span - 0.22) / 0.22, 2)) * (1 - wShoulder);
       const wMid = Math.exp(-Math.pow((span - 0.56) / 0.24, 2));
       const wTip = Math.exp(-Math.pow((span - 0.94) / 0.25, 2));
-      const wSum = Math.max(1e-5, wCran + wBase + wMid + wTip);
-      const bIdx: [number, number, number, number] = [0, baseBone, midBone, tipBone];
+      const wSum = Math.max(1e-5, wShoulder + wBase + wMid + wTip);
+      const bIdx: [number, number, number, number] = [1, baseBone, midBone, tipBone];
       const bW: [number, number, number, number] = [
-        wCran / wSum,
+        wShoulder / wSum,
         wBase / wSum,
         wMid / wSum,
         wTip / wSum,
@@ -1315,38 +1352,62 @@ export function updateFishSkeleton(
   const speedNorm = input.speedNorm;
 
   // Tail beat angular amplitude grows with effort (gliding uses gentle trailing wave, bursting whips strongly)
-  const waveAmp = (0.36 + 0.64 * Math.min(1.85, effort)) * m;
+  const waveAmp = (0.48 + 0.72 * Math.min(1.85, effort)) * m;
   const turnBend = input.turnBendSmooth; // negative when turning left (-Z)
+  const arch = input.pitchArch * m; // + = concave climb arch (head & tail lift), - = convex dive arch
 
-  // 1. Cranium: subtle counter-yaw recoil opposite tail beat + gentle respiratory pitch
-  bones.spineCranium.rotation.y = Math.sin(phase - 0.15) * 0.032 * waveAmp;
-  bones.spineCranium.rotation.z = Math.sin(breath) * 0.012 * m;
+  // 1. Cranium & cervical bridge: split cranial pitch/yaw smoothly across spine1 (36%) and spineCranium (64%)
+  // while compensating spine2 so the posterior vertebral arch stays completely decoupled and seamless!
+  const headPitchEff = input.headPitch * m + Math.sin(breath) * 0.020 * m + input.chompRatio * 0.12 * m;
+  const headYawEff = input.headYaw * m;
 
-  // 2. Buccal-opercular respiratory pump + food bite snap
-  const breathPulse = 0.5 + 0.5 * Math.sin(breath);
-  const gillFlare = 0.5 + 0.5 * Math.sin(breath - 1.35);
-  bones.jaw.rotation.z = -(0.02 + 0.038 * breathPulse * m + input.chompRatio * 0.34);
-  bones.operculumL.rotation.y = (0.018 + 0.068 * gillFlare * m) * (1 + Math.min(0.6, effort * 0.25));
-  bones.operculumR.rotation.y = -(0.018 + 0.068 * gillFlare * m) * (1 + Math.min(0.6, effort * 0.25));
+  bones.spineCranium.rotation.y =
+    headYawEff * 0.64 + Math.sin(phase - 0.10) * 0.036 * waveAmp;
+  bones.spineCranium.rotation.z = headPitchEff * 0.64;
+  bones.spineCranium.rotation.x = THREE.MathUtils.clamp(turnBend * 0.08, -0.065, 0.065);
 
-  // 3. Vertebral column (5 thoracic/caudal vertebrae + 2 caudal fin ray segments)
-  // Progressive traveling wave phase lag (~280 deg total wave across body)
-  bones.spine1.rotation.y = Math.sin(phase - 0.55) * 0.042 * waveAmp + turnBend * 0.09;
-  bones.spine2.rotation.y = Math.sin(phase - 1.15) * 0.078 * waveAmp + turnBend * 0.18;
-  bones.spine3.rotation.y = Math.sin(phase - 1.85) * 0.125 * waveAmp + turnBend * 0.26;
-  bones.spine4.rotation.y = Math.sin(phase - 2.60) * 0.175 * waveAmp + turnBend * 0.28;
-  bones.spine5.rotation.y = Math.sin(phase - 3.35) * 0.225 * waveAmp + turnBend * 0.22;
+  // 2. Buccal-opercular double-pump respiration + periodic gulps & food bite snap
+  // Mouth draws water in (jaw drops), then ~90° later gill opercula flare outward to expel water!
+  const breathOpen = Math.pow(0.5 + 0.5 * Math.sin(breath), 1.35);
+  const gulpPulse = Math.pow(0.5 + 0.5 * Math.sin(breath * 0.27 + 0.8), 6.0);
+  const gillFlare = Math.pow(0.5 + 0.5 * Math.sin(breath - 1.55), 1.45);
+  bones.jaw.rotation.z = -(
+    0.025 +
+    (0.165 * breathOpen + 0.145 * gulpPulse) * m +
+    input.chompRatio * 0.48
+  );
+  const gillAmp =
+    (0.025 + (0.21 * gillFlare + 0.08 * gulpPulse) * m) *
+    (1 + Math.min(0.65, effort * 0.26));
+  bones.operculumL.rotation.y = gillAmp;
+  bones.operculumR.rotation.y = -gillAmp;
+
+  // 3. Vertebral column (cervical hub spine1 -> decoupled flexible spine2..5 -> 2 caudal fin ray segments)
+  bones.spine1.rotation.y = headYawEff * 0.36 + Math.sin(phase - 0.35) * 0.032 * waveAmp;
+  bones.spine2.rotation.y =
+    -headYawEff * 0.30 + Math.sin(phase - 0.85) * 0.145 * waveAmp + turnBend * 0.34;
+  bones.spine3.rotation.y = Math.sin(phase - 1.50) * 0.215 * waveAmp + turnBend * 0.44;
+  bones.spine4.rotation.y = Math.sin(phase - 2.20) * 0.280 * waveAmp + turnBend * 0.44;
+  bones.spine5.rotation.y = Math.sin(phase - 2.95) * 0.335 * waveAmp + turnBend * 0.32;
 
   // Caudal fin rays whip smoothly behind the hypural peduncle with slight pitch twist
-  bones.caudalMid.rotation.y = Math.sin(phase - 4.10) * 0.265 * waveAmp + turnBend * 0.14;
-  bones.caudalTip.rotation.y = Math.sin(phase - 4.90) * 0.295 * waveAmp + turnBend * 0.08;
-  bones.caudalMid.rotation.x = Math.cos(phase - 3.8) * 0.045 * waveAmp;
-  bones.caudalTip.rotation.x = Math.cos(phase - 4.6) * 0.065 * waveAmp;
+  bones.caudalMid.rotation.y = Math.sin(phase - 3.70) * 0.365 * waveAmp + turnBend * 0.18;
+  bones.caudalTip.rotation.y = Math.sin(phase - 4.50) * 0.395 * waveAmp + turnBend * 0.10;
+  bones.caudalMid.rotation.x = Math.cos(phase - 3.6) * 0.056 * waveAmp;
+  bones.caudalTip.rotation.x = Math.cos(phase - 4.4) * 0.078 * waveAmp;
 
-  // Subtle vertical compliance along spine during pitch maneuvers
-  const pitchFlex = THREE.MathUtils.clamp(-input.pitchAngle * 0.08, -0.05, 0.05);
-  bones.spine2.rotation.z = pitchFlex * 0.4;
-  bones.spine4.rotation.z = pitchFlex * 0.6;
+  // True dorsoventral body arching across vertebrae:
+  // spine1 shares 36% of headPitchEff while spine2 cancels it and spine2..caudalTip bow into clear C/S curves!
+  const pitchFollow = THREE.MathUtils.clamp(input.pitchAngle * 0.18, -0.11, 0.11) * m;
+  const vertWave = phase * 0.36;
+  bones.spine1.rotation.z = headPitchEff * 0.36 - arch * 0.06;
+  bones.spine2.rotation.z =
+    -headPitchEff * 0.36 - arch * 0.25 - pitchFollow * 0.22 + Math.sin(vertWave - 0.4) * 0.022 * m;
+  bones.spine3.rotation.z = -arch * 0.33 - pitchFollow * 0.30 + Math.sin(vertWave - 1.0) * 0.032 * m;
+  bones.spine4.rotation.z = -arch * 0.28 - pitchFollow * 0.26 + Math.sin(vertWave - 1.6) * 0.034 * m;
+  bones.spine5.rotation.z = -arch * 0.18 - pitchFollow * 0.16 + Math.sin(vertWave - 2.2) * 0.028 * m;
+  bones.caudalMid.rotation.z = -arch * 0.10 + Math.sin(vertWave - 2.8) * 0.024 * m;
+  bones.caudalTip.rotation.z = -arch * 0.06 + Math.sin(vertWave - 3.4) * 0.024 * m;
 
   // 4. Pectoral Fins: 3-bone articulated figure-8 labriform sculling + asymmetric turn braking
   // Left side is -Z (pectR in local +Z/-Z terms: note pectL is at +Z right flank, pectR is at -Z left flank)
@@ -1455,30 +1516,40 @@ export function createHyperrealisticFish3D(
     uPectWaveAmp: { value: 0.018 },
   };
 
-  // Build 21-bone anatomical skeleton in unscaled root space
+  // Build 21-bone anatomical skeleton centered on thoracic shoulder hub (spine1 at x=+0.13)
+  // so the cranium (x=+0.25) pitches & turns independently of the posterior vertebral column!
   const gillProfile = sampleBodyProfile(0.71, species);
   const gillOpProfile = sampleBodyProfile(0.78, species);
   const pelvProfile = sampleBodyProfile(0.60, species);
 
-  const spineCranium = new THREE.Bone();
-  spineCranium.position.set(0.28, 0, 0);
-
   const spine1 = new THREE.Bone();
-  spine1.position.set(-0.15, 0, 0);
+  spine1.position.set(0.13, 0, 0);
+  spine1.rotation.order = 'YZX';
+
+  const spineCranium = new THREE.Bone();
+  spineCranium.position.set(0.08, 0, 0); // world-local x = +0.21 (occipital nape pivot)
+  spineCranium.rotation.order = 'YZX';
+
   const spine2 = new THREE.Bone();
   spine2.position.set(-0.15, 0, 0);
+  spine2.rotation.order = 'YZX';
   const spine3 = new THREE.Bone();
   spine3.position.set(-0.15, 0, 0);
+  spine3.rotation.order = 'YZX';
   const spine4 = new THREE.Bone();
   spine4.position.set(-0.15, 0, 0);
+  spine4.rotation.order = 'YZX';
   const spine5 = new THREE.Bone();
   spine5.position.set(-0.15, 0, 0);
+  spine5.rotation.order = 'YZX';
   const caudalMid = new THREE.Bone();
   caudalMid.position.set(-0.13, 0, 0);
+  caudalMid.rotation.order = 'YZX';
   const caudalTip = new THREE.Bone();
   caudalTip.position.set(-0.14, 0, 0);
+  caudalTip.rotation.order = 'YZX';
 
-  spineCranium.add(spine1);
+  spine1.add(spineCranium);
   spine1.add(spine2);
   spine2.add(spine3);
   spine3.add(spine4);
@@ -1487,32 +1558,32 @@ export function createHyperrealisticFish3D(
   caudalMid.add(caudalTip);
 
   const jaw = new THREE.Bone();
-  jaw.position.set(0.14, -0.055, 0);
+  jaw.position.set(0.17, -0.042, 0); // world-local x = +0.38 (clean mandible hinge)
   const operculumL = new THREE.Bone();
-  operculumL.position.set(0.02, -0.01, gillOpProfile.hw * 0.72);
+  operculumL.position.set(0.11, -0.01, gillOpProfile.hw * 0.70); // world-local x = +0.32
   const operculumR = new THREE.Bone();
-  operculumR.position.set(0.02, -0.01, -gillOpProfile.hw * 0.72);
+  operculumR.position.set(0.11, -0.01, -gillOpProfile.hw * 0.70);
   spineCranium.add(jaw, operculumL, operculumR);
 
   const pectLBase = new THREE.Bone();
-  pectLBase.position.set(-0.07, gillProfile.yCenter - 0.042, gillProfile.hw * 0.84);
+  pectLBase.position.set(0.08, gillProfile.yCenter - 0.042, gillProfile.hw * 0.84); // world-local x = +0.21
   const pectLMid = new THREE.Bone();
   pectLMid.position.set(-0.068, -0.008, 0.018);
   const pectLTip = new THREE.Bone();
   pectLTip.position.set(-0.068, -0.008, 0.018);
   pectLBase.add(pectLMid);
   pectLMid.add(pectLTip);
-  spineCranium.add(pectLBase);
+  spine1.add(pectLBase);
 
   const pectRBase = new THREE.Bone();
-  pectRBase.position.set(-0.07, gillProfile.yCenter - 0.042, -gillProfile.hw * 0.84);
+  pectRBase.position.set(0.08, gillProfile.yCenter - 0.042, -gillProfile.hw * 0.84);
   const pectRMid = new THREE.Bone();
   pectRMid.position.set(-0.068, -0.008, -0.018);
   const pectRTip = new THREE.Bone();
   pectRTip.position.set(-0.068, -0.008, -0.018);
   pectRBase.add(pectRMid);
   pectRMid.add(pectRTip);
-  spineCranium.add(pectRBase);
+  spine1.add(pectRBase);
 
   const pelvicLBase = new THREE.Bone();
   pelvicLBase.position.set(-0.035, pelvProfile.yCenter - pelvProfile.hh * 0.80, pelvProfile.hw * 0.30);
@@ -1576,7 +1647,7 @@ export function createHyperrealisticFish3D(
     pelvicRTip,
   };
 
-  root.add(spineCranium);
+  root.add(spine1);
 
   // Build skinned geometries & materials
   const bodyGeom = buildBodyGeometry(species);
@@ -1640,11 +1711,12 @@ export function createHyperrealisticFish3D(
   // Apply world scale after clean identity bind
   root.scale.setScalar(worldScale);
 
-  // 3D Dual-Layer Eyeballs attached directly to spineCranium so eyes lock with head recoil
+  // 3D Dual-Layer Eyeballs attached directly to spineCranium so eyes lock with cranial pitch & yaw
   const eyeSocket = sampleBodyProfile(0.84, species);
-  const eyeX = 0.34 - spineCranium.position.x; // relative to spineCranium
+  const craniumRootX = spine1.position.x + spineCranium.position.x; // 0.25
+  const eyeX = 0.34 - craniumRootX; // relative to spineCranium
   const eyeY = eyeSocket.yCenter + eyeSocket.hh * 0.24;
-  const eyeZ = eyeSocket.hw * 0.84;
+  const eyeZ = eyeSocket.hw * 0.78;
   const eyeRadius = species === 'tang' ? 0.034 : 0.038;
 
   const irisGeom = new THREE.SphereGeometry(eyeRadius, 20, 16);

@@ -2,12 +2,15 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type {
+  AquariumBackgroundId,
   AquariumCounts,
   AquariumLighting,
   FishSpecies,
   LightingPreset,
   PlantStyle,
   SelectedDecor,
+  TankDimensions,
+  TankSizePreset,
 } from '../types/aquarium';
 import { loadAquariumSprites, type AquariumSprites } from '../utils/spriteLoader';
 import {
@@ -30,9 +33,12 @@ import {
   type AquariumPhotoTextures,
 } from './photoTextures';
 import {
+  computeTankVerticalBounds,
   createAquariumTank3D,
   sandHeightAt,
   TANK_D,
+  TANK_H,
+  TANK_SAND_BASE_Y,
   TANK_W,
   TANK_WATER_TOP_Y,
   type Tank3DHandle,
@@ -49,6 +55,30 @@ const MIN_SATIETY = 0.0;
 const MAX_SATIETY = 1.45;
 const HUNGER_DECAY_PER_SEC = 0.085 / 3600; // ~8h normal -> thin, ~9h overfed -> normal
 const FOOD_SATIETY_GAIN = 0.14;
+
+const DEFAULT_TANK_DIMS: TankDimensions = {
+  preset: 'standard',
+  width: TANK_W,
+  height: TANK_H,
+  depth: TANK_D,
+};
+
+const VALID_BACKGROUNDS: AquariumBackgroundId[] = [
+  'natural',
+  'reef',
+  'amazon',
+  'slate',
+  'frosted',
+  'abyss',
+];
+
+const VALID_PRESETS: TankSizePreset[] = [
+  'compact',
+  'standard',
+  'large',
+  'panoramic',
+  'custom',
+];
 
 interface SavedFishV1 {
   species: FishSpecies;
@@ -79,6 +109,8 @@ interface SavedAquariumV1 {
   nextSeed: number;
   nextExtraSpeciesIdx: number;
   lighting: AquariumLighting;
+  tankDims?: TankDimensions;
+  backgroundId?: AquariumBackgroundId;
   fish: SavedFishV1[];
   plants: SavedPlantV1[];
   stones: SavedStoneV1[];
@@ -113,6 +145,33 @@ interface FishEntity3D {
   chompTimer: number;
   targetFoodId: string | null;
   dustCooldown: number;
+  avoidSide: 1 | -1;
+  avoidSideTimer: number;
+  blockedTime: number;
+  evadeTimer: number;
+  evadeLockTimer: number;
+  evadeYaw: number;
+  evadePitch: number;
+  yieldFoodTimer: number;
+  contactRepickCooldown: number;
+  evadeVx: number;
+  evadeVy: number;
+  evadeVz: number;
+  pushSteerX: number;
+  pushSteerY: number;
+  pushSteerZ: number;
+  headPitchCur: number;
+  headYawCur: number;
+  pitchArchCur: number;
+  curiosityPhase: number;
+  curiosityRate: number;
+  archPhase: number;
+  archRate: number;
+  paceMode: 'hover' | 'slow' | 'cruise' | 'sprint';
+  paceTimer: number;
+  paceSpeedMul: number;
+  paceEffortMul: number;
+  touchSpeedCooldown: number;
 }
 
 interface PlantEntity3D {
@@ -208,6 +267,8 @@ export interface AquariumScene3DCallbacks {
   onCountsChange: (counts: AquariumCounts) => void;
   onSelectionChange: (selected: SelectedDecor | null) => void;
   onLightingLoaded?: (lighting: AquariumLighting) => void;
+  onTankDimensionsLoaded?: (dims: TankDimensions) => void;
+  onBackgroundLoaded?: (backgroundId: AquariumBackgroundId) => void;
 }
 
 // Pre-allocated scratch helpers (zero GC in render loop)
@@ -471,8 +532,18 @@ export class AquariumScene3DController {
   private sprites: AquariumSprites | null = null;
   private photoTextures: AquariumPhotoTextures | null = null;
   private tank: Tank3DHandle | null = null;
+  private tankDims: TankDimensions = { ...DEFAULT_TANK_DIMS };
+  private tankSandBaseY = TANK_SAND_BASE_Y;
+  private tankWaterTopY = TANK_WATER_TOP_Y;
+  private backgroundId: AquariumBackgroundId = 'natural';
   private speciesTextures: Partial<Record<FishSpecies, SpeciesTextureSet>> = {};
-  private sunbeams: { mesh: THREE.Mesh; mat: THREE.ShaderMaterial; phase: number }[] = [];
+  private sunbeams: {
+    mesh: THREE.Mesh;
+    mat: THREE.ShaderMaterial;
+    phase: number;
+    nx: number;
+    nz: number;
+  }[] = [];
 
   private hemiLight!: THREE.HemisphereLight;
   private sunKeyLight!: THREE.DirectionalLight;
@@ -605,8 +676,8 @@ export class AquariumScene3DController {
     this.controls.enableDamping = !this.isSoftwareGl;
     this.controls.dampingFactor = 0.06;
     this.controls.enablePan = false;
-    this.controls.minDistance = 4.4;
-    this.controls.maxDistance = 13.5;
+    this.controls.minDistance = 3.8;
+    this.controls.maxDistance = 17.5;
     this.controls.minPolarAngle = 0.36;
     this.controls.maxPolarAngle = Math.PI * 0.56;
     this.controls.minAzimuthAngle = -Math.PI * 0.44;
@@ -732,11 +803,46 @@ gl_FragColor.a *= bAlpha;
     this.startLoop();
   }
 
+  private sandY(x: number, z: number): number {
+    return sandHeightAt(x, z, {
+      width: this.tankDims.width,
+      depth: this.tankDims.depth,
+      sandBaseY: this.tankSandBaseY,
+    });
+  }
+
+  private getSwimYBounds(): { minY: number; maxY: number } {
+    const minY = this.tankSandBaseY + 0.06;
+    const maxY = Math.max(minY + 0.45, this.tankWaterTopY - 0.24);
+    return { minY, maxY };
+  }
+
+  private sanitizeTankDimensions(dims: TankDimensions): TankDimensions {
+    const preset: TankSizePreset = VALID_PRESETS.includes(dims.preset) ? dims.preset : 'custom';
+    const width = Number.isFinite(dims.width)
+      ? THREE.MathUtils.clamp(Number(dims.width.toFixed(2)), 3.6, 7.6)
+      : TANK_W;
+    const height = Number.isFinite(dims.height)
+      ? THREE.MathUtils.clamp(Number(dims.height.toFixed(2)), 2.4, 4.0)
+      : TANK_H;
+    const depth = Number.isFinite(dims.depth)
+      ? THREE.MathUtils.clamp(Number(dims.depth.toFixed(2)), 2.2, 4.2)
+      : TANK_D;
+    return { preset, width, height, depth };
+  }
+
   private getIdealCameraDistance(): number {
     const aspect = this.viewportW / Math.max(1, this.viewportH);
     const vFov = THREE.MathUtils.degToRad(this.camera.fov);
-    const neededForWidth = (TANK_W * 1.16) / (2 * Math.tan(vFov * 0.5) * aspect);
-    return THREE.MathUtils.clamp(Math.max(6.4, neededForWidth), 6.2, 11.8);
+    const neededForWidth =
+      (this.tankDims.width * 1.16) / (2 * Math.tan(vFov * 0.5) * aspect);
+    const neededForHeight = (this.tankDims.height * 1.3) / (2 * Math.tan(vFov * 0.5));
+    const depthPad = Math.max(0, this.tankDims.depth - TANK_D) * 0.35;
+    return THREE.MathUtils.clamp(
+      Math.max(this.tankDims.width * 1.16, neededForWidth, neededForHeight) + depthPad,
+      4.8,
+      15.2
+    );
   }
 
   private setDefaultCameraPose(immediate: boolean): void {
@@ -771,6 +877,210 @@ gl_FragColor.a *= bAlpha;
       preset,
       intensity: THREE.MathUtils.clamp(rawInt, 0.15, 1.6),
     };
+    this.saveState();
+  }
+
+  public setBackground(id: AquariumBackgroundId): void {
+    const safeId: AquariumBackgroundId = VALID_BACKGROUNDS.includes(id) ? id : 'natural';
+    this.backgroundId = safeId;
+    if (this.tank && this.photoTextures) {
+      this.tank.setBackground(safeId, this.photoTextures);
+    }
+    this.saveState();
+  }
+
+  private syncTankEnvironmentBounds(): void {
+    const w = this.tankDims.width;
+    const h = this.tankDims.height;
+    const d = this.tankDims.depth;
+    const { sandBaseY, waterTopY } = computeTankVerticalBounds(h);
+    this.tankSandBaseY = sandBaseY;
+    this.tankWaterTopY = waterTopY;
+
+    this.waterFogUniforms.uTankMin.value.set(-w * 0.5, sandBaseY - 0.39, -d * 0.5);
+    this.waterFogUniforms.uTankMax.value.set(w * 0.5, waterTopY, d * 0.5);
+
+    if (!this.isSoftwareGl && this.sunKeyLight?.shadow) {
+      const halfSpanX = Math.max(2.6, w * 0.68);
+      const halfSpanY = Math.max(2.4, Math.max(h, d) * 0.85);
+      this.sunKeyLight.shadow.camera.left = -halfSpanX;
+      this.sunKeyLight.shadow.camera.right = halfSpanX;
+      this.sunKeyLight.shadow.camera.top = halfSpanY;
+      this.sunKeyLight.shadow.camera.bottom = -halfSpanY;
+      this.sunKeyLight.shadow.camera.updateProjectionMatrix();
+    }
+
+    const beamScaleX = w / TANK_W;
+    const beamScaleY = Math.max(0.62, (waterTopY - sandBaseY) / (TANK_WATER_TOP_Y - TANK_SAND_BASE_Y));
+    const beamCenterY = (waterTopY + sandBaseY) * 0.5 + 0.1;
+    for (const b of this.sunbeams) {
+      b.mesh.position.set(b.nx * w, beamCenterY, b.nz * d);
+      b.mesh.scale.set(beamScaleX, beamScaleY, 1);
+    }
+    if (this.motesMat?.uniforms.uTankWidthScale) {
+      this.motesMat.uniforms.uTankWidthScale.value = beamScaleX;
+    }
+    if (this.detritusMat?.uniforms.uTankWidthScale) {
+      this.detritusMat.uniforms.uTankWidthScale.value = beamScaleX;
+    }
+  }
+
+  private rebuildTankMesh(): void {
+    if (!this.photoTextures) return;
+    const prevTime = this.tank?.uniforms.uTime.value ?? this.elapsedTime;
+    const prevMotion = this.tank?.uniforms.uMotionAmp.value ?? 1.0;
+    const prevCaustic = this.tank?.uniforms.uCausticIntensity.value ?? 1.0;
+
+    if (this.tank) {
+      this.scene.remove(this.tank.group);
+      for (const g of this.tank.geometries) g.dispose();
+      for (const m of this.tank.materials) m.dispose();
+      this.tank = null;
+    }
+
+    const nextTank = createAquariumTank3D(
+      {
+        width: this.tankDims.width,
+        height: this.tankDims.height,
+        depth: this.tankDims.depth,
+      },
+      this.photoTextures,
+      this.backgroundId,
+      this.isSoftwareGl,
+      this.waterFogUniforms
+    );
+    nextTank.uniforms.uTime.value = prevTime;
+    nextTank.uniforms.uMotionAmp.value = prevMotion;
+    nextTank.uniforms.uCausticIntensity.value = prevCaustic;
+    this.tank = nextTank;
+    this.scene.add(nextTank.group);
+  }
+
+  private clampEntitiesToCurrentTank(): void {
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
+    const pxMin = -w * 0.5 + 0.44;
+    const pxMax = w * 0.5 - 0.44;
+    const pzMin = -d * 0.5 + 0.42;
+    const pzMax = d * 0.5 - 0.42;
+
+    for (const p of this.plantList) {
+      p.x = THREE.MathUtils.clamp(p.x, pxMin, pxMax);
+      p.z = THREE.MathUtils.clamp(p.z, pzMin, pzMax);
+      p.y = this.sandY(p.x, p.z) - 0.015;
+      p.handle.group.position.set(p.x, p.y, p.z);
+    }
+
+    for (const s of this.stoneList) {
+      s.x = THREE.MathUtils.clamp(s.x, -w * 0.5 + 0.48, w * 0.5 - 0.48);
+      s.z = THREE.MathUtils.clamp(s.z, -d * 0.5 + 0.45, d * 0.5 - 0.45);
+      const floorY = this.sandY(s.x, s.z) - 0.01;
+      s.y = THREE.MathUtils.clamp(s.y, floorY, Math.max(floorY + 0.1, this.tankWaterTopY - 0.35));
+      s.dropProgress = 1;
+      s.handle.group.position.set(s.x, s.y, s.z);
+      s.shadowMesh.position.set(s.x, floorY + 0.022, s.z);
+    }
+
+    const { minY, maxY } = this.getSwimYBounds();
+    const maxW = Math.max(0.5, w * 0.5 - Math.min(0.58, w * 0.14));
+    const maxZ = Math.max(0.4, d * 0.5 - Math.min(0.48, d * 0.16));
+    for (const f of this.fishList) {
+      f.pos.x = THREE.MathUtils.clamp(f.pos.x, -maxW, maxW);
+      f.pos.z = THREE.MathUtils.clamp(f.pos.z, -maxZ, maxZ);
+      f.pos.y = THREE.MathUtils.clamp(
+        f.pos.y,
+        Math.max(minY, this.sandY(f.pos.x, f.pos.z) + 0.22),
+        maxY
+      );
+      f.targetPos.x = THREE.MathUtils.clamp(f.targetPos.x, -maxW, maxW);
+      f.targetPos.z = THREE.MathUtils.clamp(f.targetPos.z, -maxZ, maxZ);
+      f.targetPos.y = THREE.MathUtils.clamp(
+        f.targetPos.y,
+        Math.max(minY, this.sandY(f.targetPos.x, f.targetPos.z) + 0.18),
+        maxY
+      );
+      f.rig.root.position.copy(f.pos);
+    }
+
+    for (const food of this.foods) {
+      if (!food.active) continue;
+      food.pos.x = THREE.MathUtils.clamp(food.pos.x, -w * 0.5 + 0.34, w * 0.5 - 0.34);
+      food.pos.z = THREE.MathUtils.clamp(food.pos.z, -d * 0.5 + 0.34, d * 0.5 - 0.34);
+      const floorY = this.sandY(food.pos.x, food.pos.z) + 0.022;
+      if (food.settled) {
+        food.pos.y = floorY;
+      } else {
+        food.pos.y = THREE.MathUtils.clamp(food.pos.y, floorY, this.tankWaterTopY + 0.2);
+      }
+      food.mesh.position.copy(food.pos);
+    }
+
+    const bMaxX = w * 0.5 - 0.16;
+    const bMaxZ = d * 0.5 - 0.16;
+    for (const b of this.bubbles) {
+      if (!b.active) continue;
+      b.pos.x = THREE.MathUtils.clamp(b.pos.x, -bMaxX, bMaxX);
+      b.pos.z = THREE.MathUtils.clamp(b.pos.z, -bMaxZ, bMaxZ);
+      b.pos.y = THREE.MathUtils.clamp(
+        b.pos.y,
+        this.sandY(b.pos.x, b.pos.z) + 0.02,
+        this.tankWaterTopY - 0.04
+      );
+      b.mesh.position.copy(b.pos);
+    }
+
+    if (this.motesPoints) {
+      const mAttr = this.motesPoints.geometry.attributes.position as THREE.BufferAttribute;
+      const mArr = mAttr.array as Float32Array;
+      const mMaxX = w * 0.5 - 0.24;
+      const mMaxZ = d * 0.5 - 0.24;
+      for (let i = 0; i < this.motesCount; i++) {
+        const ix = i * 3;
+        if (Math.abs(mArr[ix]) > mMaxX) mArr[ix] = (Math.random() - 0.5) * 2 * mMaxX;
+        if (Math.abs(mArr[ix + 2]) > mMaxZ) mArr[ix + 2] = (Math.random() - 0.5) * 2 * mMaxZ;
+        const floorY = this.sandY(mArr[ix], mArr[ix + 2]) + 0.04;
+        if (mArr[ix + 1] < floorY || mArr[ix + 1] > this.tankWaterTopY - 0.08) {
+          mArr[ix + 1] = THREE.MathUtils.lerp(floorY, this.tankWaterTopY - 0.12, Math.random());
+        }
+      }
+      mAttr.needsUpdate = true;
+    }
+
+    if (this.detritusPoints) {
+      const dAttr = this.detritusPoints.geometry.attributes.position as THREE.BufferAttribute;
+      const dArr = dAttr.array as Float32Array;
+      const dMaxX = w * 0.5 - 0.24;
+      const dMaxZ = d * 0.5 - 0.24;
+      for (let i = 0; i < this.detritusCount; i++) {
+        const ix = i * 3;
+        if (Math.abs(dArr[ix]) > dMaxX) dArr[ix] = (Math.random() - 0.5) * 2 * dMaxX;
+        if (Math.abs(dArr[ix + 2]) > dMaxZ) dArr[ix + 2] = (Math.random() - 0.5) * 2 * dMaxZ;
+        const floorY = this.sandY(dArr[ix], dArr[ix + 2]) + 0.03;
+        if (dArr[ix + 1] < floorY || dArr[ix + 1] > this.tankWaterTopY - 0.08) {
+          dArr[ix + 1] = THREE.MathUtils.lerp(floorY, this.tankWaterTopY - 0.12, Math.random());
+        }
+      }
+      dAttr.needsUpdate = true;
+    }
+
+    this.updateSelectionRing();
+  }
+
+  public setTankDimensions(next: TankDimensions): void {
+    const safe = this.sanitizeTankDimensions(next);
+    const same =
+      safe.width === this.tankDims.width &&
+      safe.height === this.tankDims.height &&
+      safe.depth === this.tankDims.depth &&
+      safe.preset === this.tankDims.preset;
+    if (same) return;
+
+    this.tankDims = safe;
+    this.syncTankEnvironmentBounds();
+    this.rebuildTankMesh();
+    this.clampEntitiesToCurrentTank();
+    this.tank?.triggerSurfaceWave(0, 0, 0.55);
+    this.setDefaultCameraPose(false);
     this.saveState();
   }
 
@@ -841,9 +1151,9 @@ gl_FragColor.a *= bAlpha;
     // Dynamic wave-synced volumetric god-rays descending from water surface (soft Gaussian edges)
     const beamGeom = new THREE.PlaneGeometry(1.18, 2.55, 1, 1);
     const beamConfigs = [
-      { x: -1.35, z: -0.45, rotZ: -0.22, rotY: 0.15, phase: 0.2 },
-      { x: 0.15, z: -0.65, rotZ: -0.18, rotY: -0.1, phase: 2.1 },
-      { x: 1.45, z: -0.25, rotZ: -0.24, rotY: 0.2, phase: 4.0 },
+      { nx: -1.35 / TANK_W, nz: -0.45 / TANK_D, rotZ: -0.22, rotY: 0.15, phase: 0.2 },
+      { nx: 0.15 / TANK_W, nz: -0.65 / TANK_D, rotZ: -0.18, rotY: -0.1, phase: 2.1 },
+      { nx: 1.45 / TANK_W, nz: -0.25 / TANK_D, rotZ: -0.24, rotY: 0.2, phase: 4.0 },
     ];
     for (const cfg of beamConfigs) {
       const mat = new THREE.ShaderMaterial({
@@ -882,11 +1192,11 @@ void main() {
         side: THREE.DoubleSide,
       });
       const mesh = new THREE.Mesh(beamGeom, mat);
-      mesh.position.set(cfg.x, 0.18, cfg.z);
+      mesh.position.set(cfg.nx * this.tankDims.width, 0.18, cfg.nz * this.tankDims.depth);
       mesh.rotation.set(0, cfg.rotY, cfg.rotZ);
       mesh.renderOrder = 35;
       this.scene.add(mesh);
-      this.sunbeams.push({ mesh, mat, phase: cfg.phase });
+      this.sunbeams.push({ mesh, mat, phase: cfg.phase, nx: cfg.nx, nz: cfg.nz });
     }
 
     // Light-lit circular-current suspended micro-motes inside tank volume
@@ -896,9 +1206,9 @@ void main() {
     const alphas = new Float32Array(moteCount);
     const phases = new Float32Array(moteCount);
     for (let i = 0; i < moteCount; i++) {
-      positions[i * 3] = (Math.random() - 0.5) * (TANK_W - 0.45);
+      positions[i * 3] = (Math.random() - 0.5) * (this.tankDims.width - 0.45);
       positions[i * 3 + 1] = -0.96 + Math.random() * 2.18;
-      positions[i * 3 + 2] = (Math.random() - 0.5) * (TANK_D - 0.45);
+      positions[i * 3 + 2] = (Math.random() - 0.5) * (this.tankDims.depth - 0.45);
       sizes[i] = 0.08 + Math.pow(Math.random(), 2.4) * 0.24;
       alphas[i] = 0.18 + Math.random() * 0.82;
       phases[i] = Math.random() * Math.PI * 2;
@@ -916,11 +1226,13 @@ void main() {
         uTime: { value: 0 },
         uColor: { value: new THREE.Color(0xcce8f5) },
         uLightIntensity: { value: 1.0 },
+        uTankWidthScale: { value: 1.0 },
       },
       vertexShader: `
 attribute float aSize;
 attribute float aAlpha;
 attribute float aPhase;
+uniform float uTankWidthScale;
 varying float vLightFactor;
 varying float vAlpha;
 varying float vPhase;
@@ -928,7 +1240,7 @@ void main() {
   vAlpha = aAlpha;
   vPhase = aPhase;
   // Brighten particles crossing the 3 overhead volumetric sun shafts
-  float slantX = position.x - (position.y - 0.18) * 0.22;
+  float slantX = (position.x - (position.y - 0.18) * 0.22) / max(0.5, uTankWidthScale);
   float mx1 = (slantX + 1.35) / 0.52;
   float mx2 = (slantX - 0.15) / 0.52;
   float mx3 = (slantX - 1.45) / 0.52;
@@ -984,9 +1296,9 @@ void main() {
     ];
 
     for (let i = 0; i < detCount; i++) {
-      detPos[i * 3] = (Math.random() - 0.5) * (TANK_W - 0.5);
+      detPos[i * 3] = (Math.random() - 0.5) * (this.tankDims.width - 0.5);
       detPos[i * 3 + 1] = -0.94 + Math.random() * 2.12;
-      detPos[i * 3 + 2] = (Math.random() - 0.5) * (TANK_D - 0.5);
+      detPos[i * 3 + 2] = (Math.random() - 0.5) * (this.tankDims.depth - 0.5);
 
       const c = detPalette[i % detPalette.length].clone();
       c.offsetHSL((Math.random() - 0.5) * 0.04, (Math.random() - 0.5) * 0.08, (Math.random() - 0.5) * 0.1);
@@ -1017,6 +1329,7 @@ void main() {
         uWaterColor: this.waterFogUniforms.uWaterColor,
         uSunColor: this.waterFogUniforms.uSunColor,
         uLightIntensity: { value: 1.0 },
+        uTankWidthScale: { value: 1.0 },
       },
       vertexShader: `
 attribute vec3 aColor;
@@ -1025,6 +1338,7 @@ attribute float aAlpha;
 attribute float aPhase;
 attribute float aShape;
 uniform float uTime;
+uniform float uTankWidthScale;
 varying vec3 vColor;
 varying float vAlpha;
 varying float vAngle;
@@ -1036,7 +1350,7 @@ void main() {
   vAlpha = aAlpha;
   vShape = aShape;
   vAngle = aShape + uTime * (0.35 + mod(aPhase, 0.4));
-  float slantX = position.x - (position.y - 0.18) * 0.22;
+  float slantX = (position.x - (position.y - 0.18) * 0.22) / max(0.5, uTankWidthScale);
   float dx1 = (slantX + 1.35) / 0.54;
   float dx2 = (slantX - 0.15) / 0.54;
   float dx3 = (slantX - 1.45) / 0.54;
@@ -1295,6 +1609,8 @@ void main() {
         nextSeed: this.nextSeed,
         nextExtraSpeciesIdx: this.nextExtraSpeciesIdx,
         lighting: this.targetLighting,
+        tankDims: this.tankDims,
+        backgroundId: this.backgroundId,
         fish: this.fishList.map((f) => ({
           species: f.species,
           baseScale: f.baseScale,
@@ -1355,15 +1671,26 @@ void main() {
       this.sprites = sprites;
       this.photoTextures = photoTextures;
 
-      this.tank = createAquariumTank3D(photoTextures, this.isSoftwareGl, this.waterFogUniforms);
-      this.scene.add(this.tank.group);
-
       const saved = this.loadSavedState();
+      if (saved?.tankDims && typeof saved.tankDims === 'object') {
+        this.tankDims = this.sanitizeTankDimensions(saved.tankDims);
+      }
+      if (saved?.backgroundId && VALID_BACKGROUNDS.includes(saved.backgroundId)) {
+        this.backgroundId = saved.backgroundId;
+      }
+      this.callbacks.onTankDimensionsLoaded?.(this.tankDims);
+      this.callbacks.onBackgroundLoaded?.(this.backgroundId);
+
+      this.syncTankEnvironmentBounds();
+      this.rebuildTankMesh();
+      this.setDefaultCameraPose(true);
+
       if (saved && saved.fish.length > 0) {
         this.restoreFromSavedState(saved);
       } else {
         this.populateInitialScene();
       }
+      this.clampEntitiesToCurrentTank();
       this.spawnAmbientBottomBubbles(true);
       this.spawnAirstoneBubbles(true);
       this.hasLoadedState = true;
@@ -1471,7 +1798,8 @@ void main() {
   private getSpeciesTextures(species: FishSpecies): SpeciesTextureSet {
     const existing = this.speciesTextures[species];
     if (existing) return existing;
-    const img = this.sprites?.fishPhotos[species] ?? null;
+    const photoKey = species === 'koi' ? 'goldfish' : species;
+    const img = this.sprites?.fishPhotos[photoKey] ?? null;
     const created = createSpeciesTextureSet(img, species, this.maxAnisotropy);
     this.speciesTextures[species] = created;
     return created;
@@ -1500,20 +1828,22 @@ void main() {
     scale?: number;
     seed?: number;
   }): PlantEntity3D {
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
     const style: PlantStyle =
       opts?.style ?? (Math.random() > 0.45 ? 'vallisneria' : 'sword');
     const x = THREE.MathUtils.clamp(
-      opts?.x ?? (Math.random() - 0.5) * (TANK_W - 1.1),
-      -TANK_W * 0.5 + 0.45,
-      TANK_W * 0.5 - 0.45
+      opts?.x ?? (Math.random() - 0.5) * (w - 1.1),
+      -w * 0.5 + 0.45,
+      w * 0.5 - 0.45
     );
     const z = THREE.MathUtils.clamp(
-      opts?.z ?? (Math.random() - 0.5) * (TANK_D - 0.9),
-      -TANK_D * 0.5 + 0.42,
-      TANK_D * 0.5 - 0.42
+      opts?.z ?? (Math.random() - 0.5) * (d - 0.9),
+      -d * 0.5 + 0.42,
+      d * 0.5 - 0.42
     );
     const scale = opts?.scale ?? 0.92 + Math.random() * 0.28;
-    const y = sandHeightAt(x, z) - 0.015;
+    const y = this.sandY(x, z) - 0.015;
     const seed = opts?.seed ?? this.nextSeed++;
 
     const id = genId('plant');
@@ -1552,18 +1882,20 @@ void main() {
     rotY?: number;
     seed?: number;
   }): StoneEntity3D {
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
     const x = THREE.MathUtils.clamp(
-      opts?.x ?? (Math.random() - 0.5) * (TANK_W - 1.2),
-      -TANK_W * 0.5 + 0.48,
-      TANK_W * 0.5 - 0.48
+      opts?.x ?? (Math.random() - 0.5) * (w - 1.2),
+      -w * 0.5 + 0.48,
+      w * 0.5 - 0.48
     );
     const z = THREE.MathUtils.clamp(
-      opts?.z ?? (Math.random() - 0.5) * (TANK_D - 1.0),
-      -TANK_D * 0.5 + 0.45,
-      TANK_D * 0.5 - 0.45
+      opts?.z ?? (Math.random() - 0.5) * (d - 1.0),
+      -d * 0.5 + 0.45,
+      d * 0.5 - 0.45
     );
     const scale = opts?.scale ?? 0.9 + Math.random() * 0.34;
-    const y = opts?.y ?? sandHeightAt(x, z) - 0.01;
+    const y = opts?.y ?? this.sandY(x, z) - 0.01;
     const rotY = opts?.rotY ?? Math.random() * Math.PI * 2;
     const seed = opts?.seed ?? this.nextSeed++;
 
@@ -1592,7 +1924,7 @@ void main() {
     });
     const shadowMesh = new THREE.Mesh(this.rockShadowGeom, shadowMat);
     shadowMesh.renderOrder = 12;
-    shadowMesh.position.set(x, sandHeightAt(x, z) + 0.012, z);
+    shadowMesh.position.set(x, this.sandY(x, z) + 0.012, z);
     const baseDia = handle.radiusXZ * scale * 2.35;
     shadowMesh.scale.set(baseDia, 1, baseDia * 0.88);
     this.scene.add(shadowMesh);
@@ -1637,21 +1969,25 @@ void main() {
   }
 
   private pickNonOverlappingFishSpawn(): { x: number; y: number; z: number } {
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
+    const { minY, maxY } = this.getSwimYBounds();
     let best = {
-      x: (Math.random() - 0.5) * (TANK_W * 0.55),
-      y: 0.05 + Math.random() * 0.72,
-      z: (Math.random() - 0.5) * (TANK_D * 0.5),
+      x: (Math.random() - 0.5) * (w * 0.55),
+      y: THREE.MathUtils.lerp(minY + 0.3, maxY - 0.15, Math.random()),
+      z: (Math.random() - 0.5) * (d * 0.5),
     };
     let bestScore = -1;
     for (let i = 0; i < 24; i++) {
-      const cx = (Math.random() - 0.5) * (TANK_W * 0.65);
-      const cy = Math.max(sandHeightAt(cx, 0) + 0.24, -0.35 + Math.random() * 1.1);
-      const cz = (Math.random() - 0.5) * (TANK_D * 0.58);
+      const cx = (Math.random() - 0.5) * (w * 0.65);
+      const cz = (Math.random() - 0.5) * (d * 0.58);
+      const floorClear = Math.max(minY + 0.14, this.sandY(cx, cz) + 0.24);
+      const cy = floorClear + Math.random() * Math.max(0.22, maxY - 0.1 - floorClear);
       if (this.isPointInsideObstacle(cx, cy, cz, 0.34)) continue;
       let minDist = 99;
       for (const f of this.fishList) {
-        const d = Math.hypot(cx - f.pos.x, cy - f.pos.y, cz - f.pos.z);
-        if (d < minDist) minDist = d;
+        const d3 = Math.hypot(cx - f.pos.x, cy - f.pos.y, cz - f.pos.z);
+        if (d3 < minDist) minDist = d3;
       }
       if (minDist > bestScore) {
         bestScore = minDist;
@@ -1684,9 +2020,10 @@ void main() {
       this.waterFogUniforms
     );
 
-    const startX = x ?? (Math.random() - 0.5) * (TANK_W * 0.55);
-    const startY = y ?? -0.1 + Math.random() * 0.85;
-    const startZ = z ?? (Math.random() - 0.5) * (TANK_D * 0.5);
+    const { minY, maxY } = this.getSwimYBounds();
+    const startX = x ?? (Math.random() - 0.5) * (this.tankDims.width * 0.55);
+    const startY = y ?? THREE.MathUtils.lerp(minY + 0.35, maxY - 0.15, Math.random());
+    const startZ = z ?? (Math.random() - 0.5) * (this.tankDims.depth * 0.5);
 
     rig.root.position.set(startX, startY, startZ);
     this.scene.add(rig.root);
@@ -1724,28 +2061,139 @@ void main() {
       chompTimer: 0,
       targetFoodId: null,
       dustCooldown: 0,
+      avoidSide: Math.random() > 0.5 ? 1 : -1,
+      avoidSideTimer: 0,
+      blockedTime: 0,
+      evadeTimer: 0,
+      evadeLockTimer: 0,
+      evadeYaw: yaw,
+      evadePitch: 0,
+      yieldFoodTimer: 0,
+      contactRepickCooldown: 0,
+      evadeVx: 0,
+      evadeVy: 0,
+      evadeVz: 0,
+      pushSteerX: 0,
+      pushSteerY: 0,
+      pushSteerZ: 0,
+      headPitchCur: 0,
+      headYawCur: 0,
+      pitchArchCur: 0,
+      curiosityPhase: Math.random() * Math.PI * 2,
+      curiosityRate: 1.45 + Math.random() * 0.65,
+      archPhase: Math.random() * Math.PI * 2,
+      archRate: 1.35 + Math.random() * 0.65,
+      paceMode: 'cruise',
+      paceTimer: 1.2 + Math.random() * 2.4,
+      paceSpeedMul: 0.95,
+      paceEffortMul: 0.95,
+      touchSpeedCooldown: 0,
     };
+
+    const initRoll = Math.random();
+    if (initRoll < 0.18) {
+      this.assignFishPace(entity, 'hover', 1.1 + Math.random() * 1.2);
+    } else if (initRoll < 0.48) {
+      this.assignFishPace(entity, 'slow');
+    } else if (initRoll < 0.84) {
+      this.assignFishPace(entity, 'cruise');
+    } else {
+      this.assignFishPace(entity, 'sprint');
+    }
 
     this.fishList.push(entity);
     return entity;
   }
 
-  private pickNextFishWaypoint(currentX: number): THREE.Vector3 {
-    const maxW = TANK_W * 0.5 - 0.65;
-    const maxY = 0.96;
-    const maxZ = TANK_D * 0.5 - 0.52;
-    const targetSide = currentX > 0 ? -1 : 1;
-    for (let attempt = 0; attempt < 16; attempt++) {
-      const tx = targetSide * (0.22 + Math.random() * 0.72) * maxW;
-      const tz = (Math.random() * 2 - 1) * maxZ;
-      const minY = Math.max(-0.98, sandHeightAt(tx, tz) + 0.16);
-      const ty = minY + Math.random() * Math.max(0.25, maxY - minY);
-      if (!this.isPointInsideObstacle(tx, ty, tz, 0.34)) {
-        return new THREE.Vector3(tx, ty, tz);
+  private assignFishPace(
+    f: FishEntity3D,
+    mode?: 'hover' | 'slow' | 'cruise' | 'sprint',
+    durationOverride?: number
+  ): void {
+    let chosen = mode;
+    if (!chosen) {
+      const r = Math.random();
+      if (f.paceMode === 'hover') {
+        chosen = r < 0.30 ? 'slow' : r < 0.74 ? 'cruise' : 'sprint';
+      } else if (f.paceMode === 'sprint') {
+        chosen = r < 0.28 ? 'hover' : r < 0.64 ? 'slow' : 'cruise';
+      } else {
+        chosen = r < 0.24 ? 'hover' : r < 0.54 ? 'slow' : r < 0.82 ? 'cruise' : 'sprint';
       }
     }
-    const fallbackX = targetSide * 0.65;
-    return new THREE.Vector3(fallbackX, 0.42, (Math.random() - 0.5) * 0.8);
+    f.paceMode = chosen;
+    if (chosen === 'hover') {
+      f.paceSpeedMul = 0.04 + Math.random() * 0.08;
+      f.paceEffortMul = 0.20 + Math.random() * 0.08;
+      f.paceTimer = durationOverride ?? 1.15 + Math.random() * 1.55;
+    } else if (chosen === 'slow') {
+      f.paceSpeedMul = 0.34 + Math.random() * 0.22;
+      f.paceEffortMul = 0.45 + Math.random() * 0.18;
+      f.paceTimer = durationOverride ?? 1.8 + Math.random() * 2.2;
+    } else if (chosen === 'sprint') {
+      f.paceSpeedMul = 1.45 + Math.random() * 0.48;
+      f.paceEffortMul = 1.45 + Math.random() * 0.45;
+      f.paceTimer = durationOverride ?? 0.85 + Math.random() * 1.05;
+    } else {
+      f.paceSpeedMul = 0.85 + Math.random() * 0.30;
+      f.paceEffortMul = 0.86 + Math.random() * 0.26;
+      f.paceTimer = durationOverride ?? 2.0 + Math.random() * 2.4;
+    }
+  }
+
+  private pickNextFishWaypoint(
+    currentX: number,
+    avoidFromPos?: THREE.Vector3,
+    escapeDirX?: number,
+    escapeDirZ?: number
+  ): THREE.Vector3 {
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
+    const { minY: swimMinY, maxY: swimMaxY } = this.getSwimYBounds();
+    const maxW = Math.max(0.5, w * 0.5 - Math.min(0.72, w * 0.16));
+    const maxY = swimMaxY - 0.12;
+    const maxZ = Math.max(0.4, d * 0.5 - Math.min(0.56, d * 0.18));
+    const targetSide = currentX > 0 ? -1 : 1;
+    let bestPoint: THREE.Vector3 | null = null;
+    let bestScore = -Infinity;
+
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const side = attempt < 12 ? targetSide : (Math.random() > 0.5 ? 1 : -1);
+      const tx = side * (0.18 + Math.random() * 0.74) * maxW;
+      const tz = (Math.random() * 2 - 1) * maxZ;
+      const minY = Math.max(swimMinY + 0.14, this.sandY(tx, tz) + 0.18);
+      const ty = minY + Math.random() * Math.max(0.25, maxY - minY);
+      if (this.isPointInsideObstacle(tx, ty, tz, 0.38)) continue;
+
+      let score = 0;
+      if (avoidFromPos) {
+        const dx = tx - avoidFromPos.x;
+        const dy = ty - avoidFromPos.y;
+        const dz = tz - avoidFromPos.z;
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist < 0.8) continue;
+        score += Math.min(2.4, dist * 0.65);
+        if (escapeDirX !== undefined && escapeDirZ !== undefined) {
+          const dot = (dx * escapeDirX + dz * escapeDirZ) / Math.max(0.01, Math.hypot(dx, dz));
+          score += dot * 1.4;
+        }
+      } else {
+        score += Math.random();
+      }
+      // Prefer open mid-water away from extreme corners when picking escape waypoints
+      const edgeProx = Math.max(Math.abs(tx) / maxW, Math.abs(tz) / maxZ);
+      score -= Math.max(0, edgeProx - 0.72) * 1.6;
+
+      if (score > bestScore) {
+        bestScore = score;
+        if (!bestPoint) bestPoint = new THREE.Vector3(tx, ty, tz);
+        else bestPoint.set(tx, ty, tz);
+      }
+    }
+
+    if (bestPoint) return bestPoint;
+    const fallbackX = targetSide * Math.min(0.65, maxW * 0.5);
+    return new THREE.Vector3(fallbackX, THREE.MathUtils.lerp(swimMinY + 0.3, maxY, 0.5), (Math.random() - 0.5) * 0.4);
   }
 
   private emitCounts(): void {
@@ -1790,11 +2238,13 @@ void main() {
 
   public addPlant(): void {
     if (!this.editMode || !this.photoTextures) return;
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
     const existingX = this.plantList.map((p) => p.x);
-    let bestX = (Math.random() - 0.5) * (TANK_W - 1.2);
+    let bestX = (Math.random() - 0.5) * (w - 1.2);
     let bestDist = -1;
     for (let i = 0; i < 8; i++) {
-      const cx = (Math.random() - 0.5) * (TANK_W - 1.1);
+      const cx = (Math.random() - 0.5) * (w - 1.1);
       let minD = 99;
       for (const ex of existingX) minD = Math.min(minD, Math.abs(cx - ex));
       if (minD > bestDist) {
@@ -1802,7 +2252,7 @@ void main() {
         bestX = cx;
       }
     }
-    const z = (Math.random() - 0.5) * (TANK_D - 1.0);
+    const z = (Math.random() - 0.5) * (d - 1.0);
     const plant = this.spawnPlantInternal({ x: bestX, z });
     this.spawnBubbleBurst(plant.x, plant.y + 0.12, plant.z, 5);
     this.emitCounts();
@@ -1811,11 +2261,13 @@ void main() {
 
   public addStone(): void {
     if (!this.editMode || !this.photoTextures || !this.tank) return;
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
     const existingX = this.stoneList.map((s) => s.x);
-    let bestX = (Math.random() - 0.5) * (TANK_W - 1.2);
+    let bestX = (Math.random() - 0.5) * (w - 1.2);
     let bestDist = -1;
     for (let i = 0; i < 8; i++) {
-      const cx = (Math.random() - 0.5) * (TANK_W - 1.2);
+      const cx = (Math.random() - 0.5) * (w - 1.2);
       let minD = 99;
       for (const ex of existingX) minD = Math.min(minD, Math.abs(cx - ex));
       if (minD > bestDist) {
@@ -1823,7 +2275,7 @@ void main() {
         bestX = cx;
       }
     }
-    const z = (Math.random() - 0.5) * (TANK_D - 1.0);
+    const z = (Math.random() - 0.5) * (d - 1.0);
     const stone = this.spawnStoneInternal({ x: bestX, z });
     this.spawnBubbleBurst(stone.x, stone.y + 0.08, stone.z, 4);
     this.emitCounts();
@@ -1844,13 +2296,13 @@ void main() {
 
   public bringSelectedForward(): void {
     if (!this.editMode || !this.selectedDecor) return;
-    const zMin = -TANK_D * 0.5 + 0.44;
-    const zMax = TANK_D * 0.5 - 0.44;
+    const zMin = -this.tankDims.depth * 0.5 + 0.44;
+    const zMax = this.tankDims.depth * 0.5 - 0.44;
     if (this.selectedDecor.kind === 'plant') {
       const p = this.plantList.find((item) => item.id === this.selectedDecor!.id);
       if (p) {
         p.z = THREE.MathUtils.clamp(p.z + 0.34, zMin, zMax);
-        p.y = sandHeightAt(p.x, p.z) - 0.015;
+        p.y = this.sandY(p.x, p.z) - 0.015;
         p.handle.group.position.set(p.x, p.y, p.z);
         this.updateSelectionRing();
         this.saveState();
@@ -1858,10 +2310,10 @@ void main() {
     } else {
       const s = this.stoneList.find((item) => item.id === this.selectedDecor!.id);
       if (s) {
-        const floorOld = sandHeightAt(s.x, s.z) - 0.01;
+        const floorOld = this.sandY(s.x, s.z) - 0.01;
         const heightAboveFloor = Math.max(0, s.y - floorOld);
         s.z = THREE.MathUtils.clamp(s.z + 0.34, zMin, zMax);
-        s.y = sandHeightAt(s.x, s.z) - 0.01 + heightAboveFloor;
+        s.y = this.sandY(s.x, s.z) - 0.01 + heightAboveFloor;
         s.handle.group.position.set(s.x, s.y, s.z);
         this.updateSelectionRing();
         this.saveState();
@@ -1871,13 +2323,13 @@ void main() {
 
   public sendSelectedBackward(): void {
     if (!this.editMode || !this.selectedDecor) return;
-    const zMin = -TANK_D * 0.5 + 0.44;
-    const zMax = TANK_D * 0.5 - 0.44;
+    const zMin = -this.tankDims.depth * 0.5 + 0.44;
+    const zMax = this.tankDims.depth * 0.5 - 0.44;
     if (this.selectedDecor.kind === 'plant') {
       const p = this.plantList.find((item) => item.id === this.selectedDecor!.id);
       if (p) {
         p.z = THREE.MathUtils.clamp(p.z - 0.34, zMin, zMax);
-        p.y = sandHeightAt(p.x, p.z) - 0.015;
+        p.y = this.sandY(p.x, p.z) - 0.015;
         p.handle.group.position.set(p.x, p.y, p.z);
         this.updateSelectionRing();
         this.saveState();
@@ -1885,10 +2337,10 @@ void main() {
     } else {
       const s = this.stoneList.find((item) => item.id === this.selectedDecor!.id);
       if (s) {
-        const floorOld = sandHeightAt(s.x, s.z) - 0.01;
+        const floorOld = this.sandY(s.x, s.z) - 0.01;
         const heightAboveFloor = Math.max(0, s.y - floorOld);
         s.z = THREE.MathUtils.clamp(s.z - 0.34, zMin, zMax);
-        s.y = sandHeightAt(s.x, s.z) - 0.01 + heightAboveFloor;
+        s.y = this.sandY(s.x, s.z) - 0.01 + heightAboveFloor;
         s.handle.group.position.set(s.x, s.y, s.z);
         this.updateSelectionRing();
         this.saveState();
@@ -1931,6 +2383,11 @@ void main() {
     this.stoneList = [];
 
     this.targetLighting = { preset: 'day', intensity: 1.0 };
+    this.tankDims = { ...DEFAULT_TANK_DIMS };
+    this.backgroundId = 'natural';
+    this.syncTankEnvironmentBounds();
+    this.rebuildTankMesh();
+
     for (const food of this.foods) {
       food.active = false;
       food.mesh.visible = false;
@@ -1960,8 +2417,8 @@ void main() {
     if (!this.detritusPoints) return;
     const posAttr = this.detritusPoints.geometry.attributes.position as THREE.BufferAttribute;
     const arr = posAttr.array as Float32Array;
-    const mMaxX = TANK_W * 0.5 - 0.25;
-    const mMaxZ = TANK_D * 0.5 - 0.25;
+    const mMaxX = this.tankDims.width * 0.5 - 0.25;
+    const mMaxZ = this.tankDims.depth * 0.5 - 0.25;
 
     for (let i = 0; i < count; i++) {
       const idx = this.detritusCrumbCursor % this.detritusCount;
@@ -1970,8 +2427,8 @@ void main() {
       arr[ix] = THREE.MathUtils.clamp(x + (Math.random() - 0.5) * 0.14, -mMaxX, mMaxX);
       arr[ix + 1] = THREE.MathUtils.clamp(
         y + (Math.random() - 0.5) * 0.10,
-        sandHeightAt(x, z) + 0.03,
-        TANK_WATER_TOP_Y - 0.08
+        this.sandY(x, z) + 0.03,
+        this.tankWaterTopY - 0.08
       );
       arr[ix + 2] = THREE.MathUtils.clamp(z + (Math.random() - 0.5) * 0.14, -mMaxZ, mMaxZ);
     }
@@ -1987,8 +2444,8 @@ void main() {
   ): void {
     const dustCount = intensity > 0.72 ? 6 : intensity > 0.38 ? 4 : 3;
     const grainCount = intensity > 0.72 ? 7 : intensity > 0.38 ? 5 : 3;
-    const mMaxX = TANK_W * 0.5 - 0.12;
-    const mMaxZ = TANK_D * 0.5 - 0.12;
+    const mMaxX = this.tankDims.width * 0.5 - 0.12;
+    const mMaxZ = this.tankDims.depth * 0.5 - 0.12;
 
     for (let n = 0; n < dustCount; n++) {
       let slot = this.sandDustPool.find((d) => !d.active);
@@ -2002,7 +2459,7 @@ void main() {
 
       const px = THREE.MathUtils.clamp(x + (Math.random() - 0.5) * 0.18, -mMaxX, mMaxX);
       const pz = THREE.MathUtils.clamp(z + (Math.random() - 0.5) * 0.18, -mMaxZ, mMaxZ);
-      const floorY = sandHeightAt(px, pz);
+      const floorY = this.sandY(px, pz);
       const angle = Math.random() * Math.PI * 2;
       const radialSpeed = (0.06 + Math.random() * 0.14) * (0.7 + intensity * 0.6);
 
@@ -2031,7 +2488,7 @@ void main() {
 
       const px = THREE.MathUtils.clamp(x + (Math.random() - 0.5) * 0.15, -mMaxX, mMaxX);
       const pz = THREE.MathUtils.clamp(z + (Math.random() - 0.5) * 0.15, -mMaxZ, mMaxZ);
-      const floorY = sandHeightAt(px, pz);
+      const floorY = this.sandY(px, pz);
       const angle = Math.random() * Math.PI * 2;
       const radialSpeed = (0.08 + Math.random() * 0.18) * (0.7 + intensity * 0.6);
 
@@ -2079,7 +2536,7 @@ void main() {
       const ptX = f.pos.x + fx * off;
       const ptZ = f.pos.z + fz * off;
       const ptBottomY = f.pos.y + bobY + fy * off - vClear;
-      const sandY = sandHeightAt(ptX, ptZ);
+      const sandY = this.sandY(ptX, ptZ);
       const clearance = ptBottomY - sandY;
       if (clearance < minClearance) {
         minClearance = clearance;
@@ -2103,55 +2560,242 @@ void main() {
     return { minClearance, contactX, contactZ };
   }
 
+  private estimateSideOpenness(
+    probeX: number,
+    probeY: number,
+    probeZ: number,
+    maxW: number,
+    maxZ: number,
+    ignoreStoneId: string
+  ): number {
+    // Clearance from tank glass walls
+    let clearance = Math.min(maxW - Math.abs(probeX), maxZ - Math.abs(probeZ));
+    // Clearance from other stones at roughly the same elevation
+    for (const other of this.stoneList) {
+      if (other.id === ignoreStoneId) continue;
+      const oBaseY = other.handle.group.position.y;
+      const oH = other.handle.height * other.scale;
+      if (probeY < oBaseY - 0.1 || probeY > oBaseY + oH + 0.28) continue;
+      const oR = other.handle.radiusXZ * other.scale * 0.95;
+      const d = Math.hypot(probeX - other.x, probeZ - other.z) - oR;
+      if (d < clearance) clearance = d;
+    }
+    return clearance;
+  }
+
+  private beginCommittedEscape(
+    f: FishEntity3D,
+    dirX: number,
+    dirY: number,
+    dirZ: number,
+    duration: number,
+    maxW: number,
+    minY: number,
+    maxY: number,
+    maxZ: number
+  ): void {
+    // Preserve active committed escape arc so consecutive-frame contact grazes never jitter heading
+    if (f.evadeLockTimer > 0.25) {
+      f.evadeTimer = Math.max(f.evadeTimer, f.evadeLockTimer);
+      return;
+    }
+
+    // Bias escape direction slightly inward if close to any glass boundary so fish never picks a wall
+    let ex = dirX;
+    let ey = dirY;
+    let ez = dirZ;
+    if (Math.abs(f.pos.x) > maxW - 0.55) ex += -Math.sign(f.pos.x) * 0.95;
+    if (Math.abs(f.pos.z) > maxZ - 0.36) ez += -Math.sign(f.pos.z) * 0.95;
+    if (f.pos.y < minY + 0.25) ey += 0.45;
+    else if (f.pos.y > maxY - 0.25) ey -= 0.45;
+
+    // Add consistent committed lateral orbit component so converging fish sweep cleanly aside
+    const horiz = Math.hypot(ex, ez);
+    if (horiz < 0.08) {
+      ex = -f.pos.x;
+      ez = -f.pos.z;
+    }
+    const hLen = Math.max(0.01, Math.hypot(ex, ez));
+    const nx = ex / hLen;
+    const nz = ez / hLen;
+    const sw = f.avoidSide;
+    const arcX = nx - nz * sw * 0.38;
+    const arcZ = nz + nx * sw * 0.38;
+
+    f.evadeYaw = Math.atan2(-arcZ, arcX);
+    f.evadePitch = THREE.MathUtils.clamp(Math.atan2(ey, Math.max(0.25, Math.hypot(arcX, arcZ))), -0.42, 0.42);
+    f.evadeLockTimer = Math.max(f.evadeLockTimer, duration);
+    f.evadeTimer = Math.max(f.evadeTimer, duration);
+    f.avoidSideTimer = Math.max(f.avoidSideTimer, duration + 0.35);
+
+    if (!f.targetFoodId && f.contactRepickCooldown <= 0) {
+      f.targetPos.copy(this.pickNextFishWaypoint(f.pos.x, f.pos, arcX, arcZ));
+      f.wanderTimer = 2.8 + Math.random() * 2.2;
+      f.contactRepickCooldown = 0.85;
+    }
+  }
+
   private accumulateObstacleAvoidance(
-    pos: THREE.Vector3,
+    f: FishEntity3D,
     fwd: THREE.Vector3,
     fishRad: number,
+    maxW: number,
+    minY: number,
+    maxY: number,
+    maxZ: number,
     outSteer: THREE.Vector3
-  ): boolean {
-    let nearObstacle = false;
-    const lookDist = 0.48 + fishRad * 1.2;
-    _probePos.copy(pos).addScaledVector(fwd, lookDist);
+  ): number {
+    let proximity = 0;
+    const lookNear = 0.46 + fishRad * 0.95;
+    const lookFar = 0.88 + fishRad * 1.35;
 
-    // Avoid rigid stones; soft swaying plants are intentionally swim-through
+    // 1. Asymmetric glass-wall cushioning matching live tank dimensions
+    // so front & back glass margins NEVER overlap across the center swimming lane!
+    const wallMarginX = Math.min(0.56, this.tankDims.width * 0.14);
+    const wallMarginZ = Math.min(0.38, this.tankDims.depth * 0.16);
+    const wallLook = 0.38;
+    for (let pass = 0; pass < 2; pass++) {
+      const distAhead = pass === 0 ? 0 : wallLook;
+      const px = f.pos.x + fwd.x * distAhead;
+      const py = f.pos.y + fwd.y * distAhead;
+      const pz = f.pos.z + fwd.z * distAhead;
+      const weightScale = pass === 0 ? 1.1 : 0.65;
+
+      // Smooth tank-interior tangent aligned with f.avoidSide (never pushes into perpendicular glass in corners)
+      const radCenter = Math.max(0.25, Math.hypot(px, pz));
+      const orbX = (-pz / radCenter) * f.avoidSide;
+      const orbZ = (px / radCenter) * f.avoidSide;
+
+      if (px > maxW - wallMarginX) {
+        const w = THREE.MathUtils.clamp((px - (maxW - wallMarginX)) / wallMarginX, 0, 1.3) * weightScale;
+        outSteer.x -= w * 1.45;
+        outSteer.x += orbX * w * 0.45;
+        outSteer.z += orbZ * w * 0.55;
+        proximity = Math.max(proximity, Math.min(1, w));
+      } else if (px < -maxW + wallMarginX) {
+        const w = THREE.MathUtils.clamp((-maxW + wallMarginX - px) / wallMarginX, 0, 1.3) * weightScale;
+        outSteer.x += w * 1.45;
+        outSteer.x += orbX * w * 0.45;
+        outSteer.z += orbZ * w * 0.55;
+        proximity = Math.max(proximity, Math.min(1, w));
+      }
+
+      if (pz > maxZ - wallMarginZ) {
+        const w = THREE.MathUtils.clamp((pz - (maxZ - wallMarginZ)) / wallMarginZ, 0, 1.3) * weightScale;
+        outSteer.z -= w * 1.45;
+        outSteer.x += orbX * w * 0.55;
+        outSteer.z += orbZ * w * 0.45;
+        proximity = Math.max(proximity, Math.min(1, w));
+      } else if (pz < -maxZ + wallMarginZ) {
+        const w = THREE.MathUtils.clamp((-maxZ + wallMarginZ - pz) / wallMarginZ, 0, 1.3) * weightScale;
+        outSteer.z += w * 1.45;
+        outSteer.x += orbX * w * 0.55;
+        outSteer.z += orbZ * w * 0.45;
+        proximity = Math.max(proximity, Math.min(1, w));
+      }
+
+      const floorClear = this.sandY(px, pz) + 0.22;
+      const ceilingY = f.targetFoodId ? this.tankWaterTopY - 0.14 : maxY - 0.14;
+      if (py < Math.max(minY + 0.14, floorClear)) {
+        const dFloor = Math.max(minY + 0.14, floorClear) - py;
+        outSteer.y += THREE.MathUtils.clamp(dFloor / 0.24, 0, 1.2) * weightScale;
+      } else if (py > ceilingY) {
+        outSteer.y -= THREE.MathUtils.clamp((py - ceilingY) / 0.20, 0, 1.2) * weightScale;
+      }
+    }
+
+    // 2. Rigid stones with locked side hysteresis & narrow-gap vertical/open-side escape
     for (const s of this.stoneList) {
       const baseY = s.handle.group.position.y;
       const obsH = s.handle.height * s.scale;
       const obsR = s.handle.radiusXZ * s.scale * 0.95;
 
-      for (let pass = 0; pass < 2; pass++) {
-        const pt = pass === 0 ? pos : _probePos;
-        const margin = fishRad + (pass === 0 ? 0.34 : 0.42);
-        if (pt.y < baseY - 0.08 || pt.y > baseY + obsH + margin) continue;
-        const yNorm = THREE.MathUtils.clamp((pt.y - baseY) / Math.max(0.05, obsH), 0, 1);
+      for (let pass = 0; pass < 3; pass++) {
+        const distAhead = pass === 0 ? 0 : pass === 1 ? lookNear : lookFar;
+        _probePos.copy(f.pos).addScaledVector(fwd, distAhead);
+        const margin = fishRad + (pass === 0 ? 0.34 : pass === 1 ? 0.42 : 0.48);
+        if (_probePos.y < baseY - 0.08 || _probePos.y > baseY + obsH + margin) continue;
+
+        const yNorm = THREE.MathUtils.clamp((_probePos.y - baseY) / Math.max(0.05, obsH), 0, 1);
         const taper = yNorm > 0.35 ? 1.0 - (yNorm - 0.35) * 0.24 : 1.0;
         const effR = obsR * taper;
         const safeR = effR + margin;
-        const dx = pt.x - s.x;
-        const dz = pt.z - s.z;
+        const dx = _probePos.x - s.x;
+        const dz = _probePos.z - s.z;
         const distSq = dx * dx + dz * dz;
-        if (distSq < safeR * safeR) {
-          nearObstacle = true;
-          const dist = Math.sqrt(distSq);
-          const w = Math.pow((safeR - dist) / safeR, 1.15) * (pass === 0 ? 1.35 : 0.95);
-          if (dist > 1e-4) {
-            const nx = dx / dist;
-            const nz = dz / dist;
-            const swirlSign = fwd.x * nz - fwd.z * nx >= 0 ? 1 : -1;
-            outSteer.x += (nx - nz * swirlSign * 0.65) * w;
-            outSteer.z += (nz + nx * swirlSign * 0.65) * w;
-          } else {
-            outSteer.x += 0.9 * w;
-            outSteer.z += 0.6 * w;
+        if (distSq >= safeR * safeR) continue;
+
+        const dist = Math.sqrt(distSq);
+        const normProx = (safeR - dist) / safeR;
+        const passGain = pass === 0 ? 1.35 : pass === 1 ? 0.95 : 0.60;
+        const w = Math.pow(normProx, 1.1) * passGain;
+        proximity = Math.max(proximity, Math.min(1, normProx * (pass === 0 ? 1.2 : 0.9)));
+
+        if (dist > 1e-4) {
+          const nx = dx / dist;
+          const nz = dz / dist;
+
+          const checkDist = safeR + fishRad + 0.18;
+          const txPos = -nz;
+          const tzPos = nx;
+          const openPos = this.estimateSideOpenness(
+            s.x + txPos * checkDist,
+            _probePos.y,
+            s.z + tzPos * checkDist,
+            maxW,
+            maxZ,
+            s.id
+          );
+          const openNeg = this.estimateSideOpenness(
+            s.x - txPos * checkDist,
+            _probePos.y,
+            s.z - tzPos * checkDist,
+            maxW,
+            maxZ,
+            s.id
+          );
+
+          const alignPos = fwd.x * txPos + fwd.z * tzPos;
+          const alignNeg = -(fwd.x * txPos + fwd.z * tzPos);
+          const scorePos = Math.min(0.65, openPos) * 1.7 + alignPos * 0.45;
+          const scoreNeg = Math.min(0.65, openNeg) * 1.7 + alignNeg * 0.45;
+
+          const minFlankOpen = fishRad * 1.55;
+          const bestOpen = Math.max(openPos, openNeg);
+
+          // Lock avoidSide completely during active escape maneuver so fish never oscillates left-right!
+          const currentOpen = f.avoidSide > 0 ? openPos : openNeg;
+          if (
+            f.evadeLockTimer <= 0 &&
+            (f.avoidSideTimer <= 0 || (currentOpen < minFlankOpen && bestOpen > currentOpen + 0.22))
+          ) {
+            const desiredSide: 1 | -1 = scorePos >= scoreNeg ? 1 : -1;
+            if (desiredSide !== f.avoidSide) {
+              f.avoidSide = desiredSide;
+              f.avoidSideTimer = 1.35;
+            } else {
+              f.avoidSideTimer = 0.65;
+            }
           }
-          if (yNorm > 0.65) {
-            outSteer.y += w * 0.72;
+
+          const swirl = f.avoidSide;
+          outSteer.x += (nx - nz * swirl * 0.85) * w;
+          outSteer.z += (nz + nx * swirl * 0.85) * w;
+
+          if (bestOpen < minFlankOpen * 1.25 && baseY + obsH + fishRad * 1.4 < maxY) {
+            outSteer.y += w * 1.35;
+          } else if (yNorm > 0.62) {
+            outSteer.y += w * 0.78;
           }
+        } else {
+          outSteer.x += -fwd.x * 0.9 * w + f.avoidSide * 0.4 * w;
+          outSteer.z += -fwd.z * 0.9 * w - f.avoidSide * 0.4 * w;
+          outSteer.y += 0.75 * w;
         }
       }
     }
 
-    return nearObstacle;
+    return proximity;
   }
 
   private resolveFishObstacleCollisions(
@@ -2167,13 +2811,25 @@ void main() {
     const fx = Math.cos(f.yaw) * cosP;
     const fy = Math.sin(f.pitch);
     const fz = -Math.sin(f.yaw) * cosP;
-    const spineOffsets = [-halfLen * 1.05, 0, halfLen * 0.95];
+    const spineOffsets = [-halfLen * 1.0, 0, halfLen * 0.92];
 
-    // Strict collision against rigid stones only (fish weave freely between soft plant leaves)
+    // Resolve ONLY the single deepest-penetrating spine point per stone to prevent nose-vs-tail ping-pong!
+    let hitStone = false;
+    let repickNx = 0;
+    let repickNy = 0;
+    let repickNz = 0;
+
     for (const s of this.stoneList) {
       const baseY = s.handle.group.position.y;
       const obsH = s.handle.height * s.scale;
       const obsR = s.handle.radiusXZ * s.scale * 0.95;
+
+      let worstPen = 0;
+      let worstDx = 0;
+      let worstDz = 0;
+      let worstDxz = 0;
+      let worstTopPen = 0;
+      let worstYNorm = 0;
 
       for (let k = 0; k < spineOffsets.length; k++) {
         const off = spineOffsets[k];
@@ -2181,7 +2837,7 @@ void main() {
         const ptY = f.pos.y + fy * off;
         const ptZ = f.pos.z + fz * off;
 
-        const topCapY = baseY + obsH + fishRad * 0.85;
+        const topCapY = baseY + obsH * 0.94 + fishRad * 0.45;
         if (ptY < baseY - 0.05 || ptY >= topCapY) continue;
 
         const yNorm = THREE.MathUtils.clamp((ptY - baseY) / Math.max(0.05, obsH), 0, 1);
@@ -2196,48 +2852,73 @@ void main() {
 
         const radialPen = minR - dXZ;
         const topPen = topCapY - ptY;
-
-        if (yNorm > 0.72 && topPen < radialPen * 1.15) {
-          f.pos.y += topPen + 0.005;
-        } else {
-          let nx = 1;
-          let nz = 0;
-          if (dXZ > 1e-4) {
-            nx = dx / dXZ;
-            nz = dz / dXZ;
-          } else {
-            nx = Math.cos(f.yaw + Math.PI * 0.5);
-            nz = -Math.sin(f.yaw + Math.PI * 0.5);
-          }
-          f.pos.x += nx * (radialPen + 0.004);
-          f.pos.z += nz * (radialPen + 0.004);
-
-          const inward = fx * nx + fz * nz;
-          if (inward < 0) {
-            const tx = fx - nx * inward;
-            const tz = fz - nz * inward;
-            if (tx * tx + tz * tz > 1e-4) {
-              const tangentYaw = Math.atan2(-tz, tx);
-              const diff = wrapAngle(tangentYaw - f.yaw);
-              f.yaw = wrapAngle(f.yaw + diff * 0.28);
-            }
-          }
+        const effectivePen = yNorm > 0.72 ? Math.min(radialPen, topPen) : radialPen;
+        if (effectivePen > worstPen) {
+          worstPen = effectivePen;
+          worstDx = dx;
+          worstDz = dz;
+          worstDxz = dXZ;
+          worstTopPen = topPen;
+          worstYNorm = yNorm;
         }
-
-        f.pos.x = THREE.MathUtils.clamp(f.pos.x, -maxW, maxW);
-        f.pos.y = THREE.MathUtils.clamp(
-          f.pos.y,
-          Math.max(minY, sandHeightAt(f.pos.x, f.pos.z) + 0.22),
-          maxY
-        );
-        f.pos.z = THREE.MathUtils.clamp(f.pos.z, -maxZ, maxZ);
       }
+
+      if (worstPen <= 0) continue;
+
+      hitStone = true;
+      if (worstYNorm > 0.72 && worstTopPen < worstPen * 1.15) {
+        f.pos.y += worstTopPen + 0.008;
+        f.pushSteerY += 0.95;
+        f.evadeVy = Math.max(f.evadeVy, 0.30);
+        repickNy += 0.7;
+      } else {
+        let nx = 1;
+        let nz = 0;
+        if (worstDxz > 1e-4) {
+          nx = worstDx / worstDxz;
+          nz = worstDz / worstDxz;
+        } else {
+          nx = Math.cos(f.yaw + Math.PI * 0.5);
+          nz = -Math.sin(f.yaw + Math.PI * 0.5);
+        }
+        f.pos.x += nx * (worstPen + 0.008);
+        f.pos.z += nz * (worstPen + 0.008);
+
+        const tx = -nz * f.avoidSide;
+        const tz = nx * f.avoidSide;
+        f.pushSteerX += nx * 1.05 + tx * 0.95;
+        f.pushSteerZ += nz * 1.05 + tz * 0.95;
+        f.evadeVx = THREE.MathUtils.clamp(f.evadeVx + (nx * 0.20 + tx * 0.38), -0.55, 0.55);
+        f.evadeVz = THREE.MathUtils.clamp(f.evadeVz + (nz * 0.20 + tz * 0.38), -0.55, 0.55);
+        repickNx += nx * 0.7 + tx * 0.75;
+        repickNz += nz * 0.7 + tz * 0.75;
+      }
+
+      f.pos.x = THREE.MathUtils.clamp(f.pos.x, -maxW, maxW);
+      f.pos.y = THREE.MathUtils.clamp(
+        f.pos.y,
+        Math.max(minY, this.sandY(f.pos.x, f.pos.z) + 0.22),
+        maxY
+      );
+      f.pos.z = THREE.MathUtils.clamp(f.pos.z, -maxZ, maxZ);
+    }
+
+    if (hitStone) {
+      if (f.targetFoodId) {
+        f.yieldFoodTimer = Math.max(f.yieldFoodTimer, 0.95);
+        f.targetFoodId = null;
+      }
+      const escX = Math.abs(repickNx) + Math.abs(repickNz) > 1e-3 ? repickNx : -f.pos.x;
+      const escZ = Math.abs(repickNx) + Math.abs(repickNz) > 1e-3 ? repickNz : -f.pos.z;
+      this.beginCommittedEscape(f, escX, repickNy, escZ, 0.92, maxW, minY, maxY, maxZ);
     }
   }
 
   public dropFood(): void {
-    const centerX = (Math.random() - 0.5) * (TANK_W - 2.1);
-    const centerZ = (Math.random() - 0.5) * (TANK_D - 1.3);
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
+    const centerX = (Math.random() - 0.5) * Math.max(0.8, w - 2.1);
+    const centerZ = (Math.random() - 0.5) * Math.max(0.6, d - 1.3);
     const count = 7;
 
     for (let i = 0; i < count; i++) {
@@ -2270,15 +2951,15 @@ void main() {
 
       const px = THREE.MathUtils.clamp(
         centerX + (Math.random() - 0.5) * 0.9,
-        -TANK_W * 0.5 + 0.45,
-        TANK_W * 0.5 - 0.45
+        -w * 0.5 + 0.45,
+        w * 0.5 - 0.45
       );
       const pz = THREE.MathUtils.clamp(
         centerZ + (Math.random() - 0.5) * 0.7,
-        -TANK_D * 0.5 + 0.42,
-        TANK_D * 0.5 - 0.42
+        -d * 0.5 + 0.42,
+        d * 0.5 - 0.42
       );
-      const py = TANK_WATER_TOP_Y + 0.14 + Math.random() * 0.22;
+      const py = this.tankWaterTopY + 0.14 + Math.random() * 0.22;
 
       slot.active = true;
       slot.inWater = false;
@@ -2424,16 +3105,16 @@ void main() {
   }
 
   private spawnAmbientBottomBubbles(initialSeed = false): void {
-    const maxX = TANK_W * 0.5 - 0.36;
-    const maxZ = TANK_D * 0.5 - 0.34;
+    const maxX = this.tankDims.width * 0.5 - 0.36;
+    const maxZ = this.tankDims.depth * 0.5 - 0.34;
 
     if (initialSeed) {
       const seedCount = 18;
       for (let i = 0; i < seedCount; i++) {
         const bx = (Math.random() - 0.5) * 2 * maxX;
         const bz = (Math.random() - 0.5) * 2 * maxZ;
-        const floorY = sandHeightAt(bx, bz) + 0.06;
-        const by = THREE.MathUtils.lerp(floorY, TANK_WATER_TOP_Y - 0.14, Math.random());
+        const floorY = this.sandY(bx, bz) + 0.06;
+        const by = THREE.MathUtils.lerp(floorY, this.tankWaterTopY - 0.14, Math.random());
         const radius = this.sampleBubbleRadius('mixed');
         const slot = this.acquireBubbleSlot();
         this.configureBubble(slot, bx, by, bz, radius);
@@ -2470,7 +3151,7 @@ void main() {
       for (let i = 0; i < fizzCount; i++) {
         const bx = THREE.MathUtils.clamp(originX + (Math.random() - 0.5) * 0.16, -maxX, maxX);
         const bz = THREE.MathUtils.clamp(originZ + (Math.random() - 0.5) * 0.16, -maxZ, maxZ);
-        const by = sandHeightAt(bx, bz) + 0.015 + Math.random() * 0.05;
+        const by = this.sandY(bx, bz) + 0.015 + Math.random() * 0.05;
         this.configureBubble(
           this.acquireBubbleSlot(),
           bx,
@@ -2484,7 +3165,7 @@ void main() {
       for (let i = 0; i < clusterCount; i++) {
         const bx = THREE.MathUtils.clamp(originX + (Math.random() - 0.5) * 0.18, -maxX, maxX);
         const bz = THREE.MathUtils.clamp(originZ + (Math.random() - 0.5) * 0.18, -maxZ, maxZ);
-        const by = sandHeightAt(bx, bz) + 0.02 + Math.random() * 0.04;
+        const by = this.sandY(bx, bz) + 0.02 + Math.random() * 0.04;
         const radius = i === 0 ? this.sampleBubbleRadius('mixed') : this.sampleBubbleRadius('micro');
         this.configureBubble(this.acquireBubbleSlot(), bx, by, bz, radius);
       }
@@ -2498,7 +3179,7 @@ void main() {
     strength = 0.75
   ): void {
     // Only disturb the actual water surface mesh (never floating mid-water rings)
-    if (y >= TANK_WATER_TOP_Y - 0.65) {
+    if (y >= this.tankWaterTopY - 0.65) {
       this.tank?.triggerSurfaceWave(x, z, strength);
     }
   }
@@ -2510,7 +3191,7 @@ void main() {
     if (initialSeed) {
       for (let i = 0; i < 14; i++) {
         const frac = Math.random();
-        const by = THREE.MathUtils.lerp(src.y, TANK_WATER_TOP_Y - 0.1, frac);
+        const by = THREE.MathUtils.lerp(src.y, this.tankWaterTopY - 0.1, frac);
         const spread = 0.035 + frac * 0.12;
         const bx = src.x + (Math.random() - 0.5) * spread - frac * 0.06;
         const bz = src.z + (Math.random() - 0.5) * spread + frac * 0.06;
@@ -2632,10 +3313,12 @@ void main() {
 
     if (!_raycaster.ray.intersectPlane(_dragPlane, _hitPoint)) return;
 
-    const xMin = -TANK_W * 0.5 + 0.44;
-    const xMax = TANK_W * 0.5 - 0.44;
-    const zMin = -TANK_D * 0.5 + 0.42;
-    const zMax = TANK_D * 0.5 - 0.42;
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
+    const xMin = -w * 0.5 + 0.44;
+    const xMax = w * 0.5 - 0.44;
+    const zMin = -d * 0.5 + 0.42;
+    const zMax = d * 0.5 - 0.42;
 
     const rawX = THREE.MathUtils.clamp(_hitPoint.x + drag.offsetX, xMin, xMax);
     const rawY = _hitPoint.y + drag.offsetY;
@@ -2646,7 +3329,7 @@ void main() {
       if (plant) {
         plant.x = rawX;
         plant.z = rawZ;
-        plant.y = sandHeightAt(rawX, rawZ) - 0.015;
+        plant.y = this.sandY(rawX, rawZ) - 0.015;
         plant.handle.group.position.set(plant.x, plant.y, plant.z);
         this.updateSelectionRing();
       }
@@ -2655,8 +3338,8 @@ void main() {
       if (stone) {
         stone.x = rawX;
         stone.z = rawZ;
-        const floorY = sandHeightAt(rawX, rawZ) - 0.01;
-        let nextY = THREE.MathUtils.clamp(rawY, floorY, TANK_WATER_TOP_Y - 0.35);
+        const floorY = this.sandY(rawX, rawZ) - 0.01;
+        let nextY = THREE.MathUtils.clamp(rawY, floorY, this.tankWaterTopY - 0.35);
 
         // Soft magnetic resting support when stacked directly above another 3D rock!
         const myRadius = stone.handle.radiusXZ * stone.scale;
@@ -2714,27 +3397,30 @@ void main() {
         this.updatePointerNDC(e.clientX, e.clientY);
         _raycaster.setFromCamera(_vec2, this.camera);
         _vec3A.set(0, 1, 0);
-        _dragPlane.set(_vec3A, -TANK_WATER_TOP_Y);
+        _dragPlane.set(_vec3A, -this.tankWaterTopY);
+        const w = this.tankDims.width;
+        const d = this.tankDims.depth;
         const hitTopSurface =
           _raycaster.ray.intersectPlane(_dragPlane, _hitPoint) !== null &&
-          Math.abs(_hitPoint.x) <= TANK_W * 0.48 &&
-          Math.abs(_hitPoint.z) <= TANK_D * 0.48;
+          Math.abs(_hitPoint.x) <= w * 0.48 &&
+          Math.abs(_hitPoint.z) <= d * 0.48;
 
         if (hitTopSurface) {
           this.tank?.triggerSurfaceWave(_hitPoint.x, _hitPoint.z, 1.05);
           this.spawnBubbleBurst(
-            THREE.MathUtils.clamp(_hitPoint.x, -TANK_W * 0.44, TANK_W * 0.44),
-            TANK_WATER_TOP_Y - 0.08,
-            THREE.MathUtils.clamp(_hitPoint.z, -TANK_D * 0.42, TANK_D * 0.42),
+            THREE.MathUtils.clamp(_hitPoint.x, -w * 0.44, w * 0.44),
+            this.tankWaterTopY - 0.08,
+            THREE.MathUtils.clamp(_hitPoint.z, -d * 0.42, d * 0.42),
             2
           );
         } else {
           this.camera.getWorldDirection(_camForward);
           _dragPlane.setFromNormalAndCoplanarPoint(_camForward, this.controls.target);
           if (_raycaster.ray.intersectPlane(_dragPlane, _hitPoint)) {
-            const rx = THREE.MathUtils.clamp(_hitPoint.x, -TANK_W * 0.44, TANK_W * 0.44);
-            const ry = THREE.MathUtils.clamp(_hitPoint.y, -0.8, TANK_WATER_TOP_Y - 0.12);
-            const rz = THREE.MathUtils.clamp(_hitPoint.z, -TANK_D * 0.42, TANK_D * 0.42);
+            const { minY, maxY } = this.getSwimYBounds();
+            const rx = THREE.MathUtils.clamp(_hitPoint.x, -w * 0.44, w * 0.44);
+            const ry = THREE.MathUtils.clamp(_hitPoint.y, minY + 0.15, maxY);
+            const rz = THREE.MathUtils.clamp(_hitPoint.z, -d * 0.42, d * 0.42);
             this.triggerWaterSurfaceInteraction(rx, _hitPoint.y, rz, 0.78);
             this.spawnBubbleBurst(rx, ry, rz, 3);
           }
@@ -2753,12 +3439,15 @@ void main() {
     }
     _vec3A.normalize();
 
-    const maxW = TANK_W * 0.5 - 0.65;
-    const maxZ = TANK_D * 0.5 - 0.52;
+    const w = this.tankDims.width;
+    const d = this.tankDims.depth;
+    const { minY, maxY } = this.getSwimYBounds();
+    const maxW = Math.max(0.5, w * 0.5 - Math.min(0.65, w * 0.14));
+    const maxZ = Math.max(0.4, d * 0.5 - Math.min(0.52, d * 0.16));
 
     fish.targetPos.set(
       THREE.MathUtils.clamp(fish.pos.x + _vec3A.x * 2.1, -maxW, maxW),
-      THREE.MathUtils.clamp(fish.pos.y + _vec3A.y * 1.15, -0.68, 0.96),
+      THREE.MathUtils.clamp(fish.pos.y + _vec3A.y * 1.15, minY + 0.25, maxY - 0.1),
       THREE.MathUtils.clamp(fish.pos.z + _vec3A.z * 1.0, -maxZ, maxZ)
     );
     fish.wanderTimer = 1.5;
@@ -2892,23 +3581,23 @@ void main() {
       }
 
       const curRockY = s.handle.group.position.y;
-      const baseFloor = sandHeightAt(s.x, s.z);
+      const baseFloor = this.sandY(s.x, s.z);
       const approxElev = Math.max(0, curRockY - baseFloor);
       const halfRockH = s.handle.height * s.scale * 0.42;
       const projDist = approxElev + (approxElev > 0.04 ? halfRockH * 0.25 : 0);
 
       const projX = THREE.MathUtils.clamp(
         s.x + sunSlopeX * projDist,
-        -TANK_W * 0.5 + 0.22,
-        TANK_W * 0.5 - 0.22
+        -this.tankDims.width * 0.5 + 0.22,
+        this.tankDims.width * 0.5 - 0.22
       );
       const projZ = THREE.MathUtils.clamp(
         s.z + sunSlopeZ * projDist,
-        -TANK_D * 0.5 + 0.22,
-        TANK_D * 0.5 - 0.22
+        -this.tankDims.depth * 0.5 + 0.22,
+        this.tankDims.depth * 0.5 - 0.22
       );
 
-      let surfaceBelowY = sandHeightAt(projX, projZ);
+      let surfaceBelowY = this.sandY(projX, projZ);
       for (const other of this.stoneList) {
         if (other.id === s.id) continue;
         const otherTopY =
@@ -2936,9 +3625,9 @@ void main() {
       if (!food.inWater) {
         food.vel.y -= 3.2 * dt;
         food.pos.addScaledVector(food.vel, dt);
-        if (food.pos.y <= TANK_WATER_TOP_Y) {
+        if (food.pos.y <= this.tankWaterTopY) {
           food.inWater = true;
-          food.pos.y = TANK_WATER_TOP_Y - 0.01;
+          food.pos.y = this.tankWaterTopY - 0.01;
           food.vel.x *= 0.28;
           food.vel.z *= 0.28;
           food.vel.y = -(0.13 + Math.random() * 0.09);
@@ -2946,7 +3635,7 @@ void main() {
             this.tank?.triggerSurfaceWave(food.pos.x, food.pos.z, 0.68);
           }
           if (Math.random() < 0.42) {
-            this.spawnBubbleBurst(food.pos.x, TANK_WATER_TOP_Y - 0.04, food.pos.z, 1);
+            this.spawnBubbleBurst(food.pos.x, this.tankWaterTopY - 0.04, food.pos.z, 1);
           }
         }
         food.mesh.position.copy(food.pos);
@@ -2955,13 +3644,13 @@ void main() {
         const flutterZ = Math.cos(this.elapsedTime * 1.9 + food.swayPhase) * 0.045;
         food.pos.x = THREE.MathUtils.clamp(
           food.pos.x + (food.vel.x + flutterX) * dt * motionScale,
-          -TANK_W * 0.5 + 0.34,
-          TANK_W * 0.5 - 0.34
+          -this.tankDims.width * 0.5 + 0.34,
+          this.tankDims.width * 0.5 - 0.34
         );
         food.pos.z = THREE.MathUtils.clamp(
           food.pos.z + (food.vel.z + flutterZ) * dt * motionScale,
-          -TANK_D * 0.5 + 0.34,
-          TANK_D * 0.5 - 0.34
+          -this.tankDims.depth * 0.5 + 0.34,
+          this.tankDims.depth * 0.5 - 0.34
         );
         food.vel.x *= Math.max(0, 1 - dt * 1.8);
         food.vel.z *= Math.max(0, 1 - dt * 1.8);
@@ -2971,12 +3660,12 @@ void main() {
         food.mesh.rotation.y += food.rotSpeed.y * dt * motionScale;
         food.mesh.rotation.z += food.rotSpeed.z * dt * motionScale;
 
-        let floorY = sandHeightAt(food.pos.x, food.pos.z) + 0.022;
+        let floorY = this.sandY(food.pos.x, food.pos.z) + 0.022;
         let hitStone = false;
         for (const s of this.stoneList) {
           const rockR = s.handle.radiusXZ * s.scale * 0.78;
           if (Math.hypot(food.pos.x - s.x, food.pos.z - s.z) < rockR) {
-            const rockTop = s.handle.group.position.y + s.handle.height * s.scale * 0.88 + 0.018;
+            const rockTop = s.handle.group.position.y + s.handle.height * s.scale * 0.94 + 0.024;
             if (rockTop > floorY) {
               floorY = rockTop;
               hitStone = true;
@@ -3015,10 +3704,9 @@ void main() {
       this.saveState();
     }
 
-    const maxW = TANK_W * 0.5 - 0.58;
-    const minY = -1.10;
-    const maxY = 1.08;
-    const maxZ = TANK_D * 0.5 - 0.48;
+    const { minY, maxY } = this.getSwimYBounds();
+    const maxW = Math.max(0.5, this.tankDims.width * 0.5 - Math.min(0.58, this.tankDims.width * 0.14));
+    const maxZ = Math.max(0.4, this.tankDims.depth * 0.5 - Math.min(0.48, this.tankDims.depth * 0.16));
     let ateAnyFood = false;
 
     for (const f of this.fishList) {
@@ -3034,11 +3722,40 @@ void main() {
       if (f.dustCooldown > 0) {
         f.dustCooldown = Math.max(0, f.dustCooldown - dt);
       }
-      f.visualSatiety += (f.satiety - f.visualSatiety) * Math.min(1, dt * 2.8);
+      if (f.avoidSideTimer > 0) {
+        f.avoidSideTimer = Math.max(0, f.avoidSideTimer - dt);
+      }
+      if (f.evadeTimer > 0) {
+        f.evadeTimer = Math.max(0, f.evadeTimer - dt);
+      }
+      if (f.evadeLockTimer > 0) {
+        f.evadeLockTimer = Math.max(0, f.evadeLockTimer - dt);
+      }
+      if (f.yieldFoodTimer > 0) {
+        f.yieldFoodTimer = Math.max(0, f.yieldFoodTimer - dt);
+      }
+      if (f.contactRepickCooldown > 0) {
+        f.contactRepickCooldown = Math.max(0, f.contactRepickCooldown - dt);
+      }
+      if (f.touchSpeedCooldown > 0) {
+        f.touchSpeedCooldown = Math.max(0, f.touchSpeedCooldown - dt);
+      }
+      f.paceTimer -= dt * motionScale;
+      if (f.paceTimer <= 0) {
+        this.assignFishPace(f);
+      }
+      const evadeDecay = Math.exp(-dt * 4.2);
+      f.evadeVx *= evadeDecay;
+      f.evadeVy *= evadeDecay;
+      f.evadeVz *= evadeDecay;
 
-      // Look for nearest active food when not fleeing
+      f.visualSatiety += (f.satiety - f.visualSatiety) * Math.min(1, dt * 2.8);
+      f.curiosityPhase += f.curiosityRate * dt * motionScale;
+      f.archPhase += f.archRate * dt * motionScale;
+
+      // Look for nearest active food when not fleeing or yielding from a crowded food bump
       let chasedFood: FoodEntity3D | null = null;
-      if (f.fleeTimer <= 0) {
+      if (f.fleeTimer <= 0 && f.yieldFoodTimer <= 0) {
         let bestScore = Infinity;
         for (const food of this.foods) {
           if (!food.active) continue;
@@ -3049,7 +3766,7 @@ void main() {
           if (!food.inWater) score += 0.35;
           for (const other of this.fishList) {
             if (other.id !== f.id && other.targetFoodId === food.id) {
-              score += 0.55;
+              score += 3.8;
             }
           }
           if (score < bestScore) {
@@ -3061,10 +3778,10 @@ void main() {
 
       if (chasedFood) {
         f.targetFoodId = chasedFood.id;
-        const sandMinY = sandHeightAt(chasedFood.pos.x, chasedFood.pos.z) + 0.14;
+        const sandMinY = this.sandY(chasedFood.pos.x, chasedFood.pos.z) + 0.14;
         f.targetPos.set(
           THREE.MathUtils.clamp(chasedFood.pos.x, -maxW, maxW),
-          THREE.MathUtils.clamp(chasedFood.pos.y, sandMinY, TANK_WATER_TOP_Y - 0.12),
+          THREE.MathUtils.clamp(chasedFood.pos.y, sandMinY, this.tankWaterTopY - 0.08),
           THREE.MathUtils.clamp(chasedFood.pos.z, -maxZ, maxZ)
         );
       } else {
@@ -3075,36 +3792,64 @@ void main() {
       _vec3A.copy(f.targetPos).sub(f.pos);
       const distToTarget = _vec3A.length();
 
-      if (!chasedFood && (f.wanderTimer <= 0 || distToTarget < 0.35)) {
-        f.targetPos.copy(this.pickNextFishWaypoint(f.pos.x));
+      if (!chasedFood && f.evadeLockTimer <= 0 && (f.wanderTimer <= 0 || distToTarget < 0.38)) {
+        f.targetPos.copy(this.pickNextFishWaypoint(f.pos.x, f.pos));
         f.wanderTimer = 2.6 + Math.random() * 2.8;
         _vec3A.copy(f.targetPos).sub(f.pos);
       }
 
-      // Smooth predictive steering away from nearby fish AND stones/plants so they weave cleanly around obstacles
+      const cosPFwd = Math.cos(f.pitch);
+      _vec3B.set(Math.cos(f.yaw) * cosPFwd, Math.sin(f.pitch), -Math.sin(f.yaw) * cosPFwd);
+
+      // Early predictive fish-to-fish steering (checks center AND predicted nose clearance so fish part smoothly)
       _avoidVec.set(0, 0, 0);
       for (const other of this.fishList) {
         if (other.id === f.id) continue;
-        const dx = f.pos.x - other.pos.x;
-        const dy = f.pos.y - other.pos.y;
-        const dz = f.pos.z - other.pos.z;
-        const distSq = dx * dx + dy * dy + dz * dz;
-        const avoidRange = 1.05 * ((f.baseScale + other.baseScale) * 0.5) + 0.28;
+        const avoidRange = 1.48 * ((f.baseScale + other.baseScale) * 0.5) + 0.50;
+        const oCosP = Math.cos(other.pitch);
+        const oFx = Math.cos(other.yaw) * oCosP;
+        const oFy = Math.sin(other.pitch);
+        const oFz = -Math.sin(other.yaw) * oCosP;
+
+        const lookNoseX = f.pos.x + _vec3B.x * 0.42 * f.baseScale;
+        const lookNoseY = f.pos.y + _vec3B.y * 0.42 * f.baseScale;
+        const lookNoseZ = f.pos.z + _vec3B.z * 0.42 * f.baseScale;
+        const otherNoseX = other.pos.x + oFx * 0.25 * other.baseScale;
+        const otherNoseY = other.pos.y + oFy * 0.25 * other.baseScale;
+        const otherNoseZ = other.pos.z + oFz * 0.25 * other.baseScale;
+
+        const dxC = f.pos.x - other.pos.x;
+        const dyC = f.pos.y - other.pos.y;
+        const dzC = f.pos.z - other.pos.z;
+        const dC2 = dxC * dxC + dyC * dyC + dzC * dzC;
+
+        const dxN = lookNoseX - otherNoseX;
+        const dyN = lookNoseY - otherNoseY;
+        const dzN = lookNoseZ - otherNoseZ;
+        const dN2 = dxN * dxN + dyN * dyN + dzN * dzN;
+
+        const useNose = dN2 < dC2;
+        const dx = useNose ? dxN : dxC;
+        const dy = useNose ? dyN : dyC;
+        const dz = useNose ? dzN : dzC;
+        const distSq = useNose ? dN2 : dC2;
+
         if (distSq < avoidRange * avoidRange) {
           const dist = Math.sqrt(distSq);
-          const w = Math.pow((avoidRange - dist) / avoidRange, 1.35);
+          const w = Math.pow((avoidRange - dist) / avoidRange, 1.25);
+          const pairSign = f.id < other.id ? 1 : -1;
           if (dist > 1e-4) {
             const invD = 1 / dist;
             const nx = dx * invD;
             const ny = dy * invD;
             const nz = dz * invD;
-            // Radial push + gentle lateral swirl around Y so head-on fish never deadlock
-            _avoidVec.x += (nx - nz * 0.42) * w;
-            _avoidVec.y += ny * w * 1.15;
-            _avoidVec.z += (nz + nx * 0.42) * w;
+            _avoidVec.x += (nx - nz * 0.78) * w;
+            _avoidVec.y += (ny * 1.15 + pairSign * 0.24) * w;
+            _avoidVec.z += (nz + nx * 0.78) * w;
           } else {
-            _avoidVec.x += 0.8 * w;
-            _avoidVec.z += 0.6 * w;
+            _avoidVec.x += 0.8 * pairSign * w;
+            _avoidVec.y += 0.25 * pairSign * w;
+            _avoidVec.z += 0.6 * pairSign * w;
           }
         }
       }
@@ -3112,66 +3857,181 @@ void main() {
       const condSteer = computeFishConditionScales(f.visualSatiety);
       const scSteer = f.baseScale * Math.max(0.45, f.spawnScale);
       const fishSteerRad = (0.18 * Math.max(condSteer.sy, condSteer.sz * 0.88) + 0.05) * scSteer;
-      const cosPFwd = Math.cos(f.pitch);
-      _vec3B.set(Math.cos(f.yaw) * cosPFwd, Math.sin(f.pitch), -Math.sin(f.yaw) * cosPFwd);
-      _obsSteer.set(0, 0, 0);
-      const nearObstacle = this.accumulateObstacleAvoidance(f.pos, _vec3B, fishSteerRad, _obsSteer);
+      _obsSteer.set(f.pushSteerX * 0.90, f.pushSteerY * 0.90, f.pushSteerZ * 0.90);
+      const hasCollisionPush =
+        f.pushSteerX * f.pushSteerX + f.pushSteerZ * f.pushSteerZ > 0.03;
+      f.pushSteerX = 0;
+      f.pushSteerY = 0;
+      f.pushSteerZ = 0;
 
-      if (_avoidVec.lengthSq() > 0.0001 || _obsSteer.lengthSq() > 0.0001) {
-        const fishSteerWeight = chasedFood ? 1.55 : 2.15;
-        const obsSteerWeight = chasedFood ? 2.4 : 2.85;
-        _vec3A
-          .normalize()
-          .addScaledVector(_avoidVec, fishSteerWeight)
-          .addScaledVector(_obsSteer, obsSteerWeight);
+      const obsProx = this.accumulateObstacleAvoidance(
+        f,
+        _vec3B,
+        fishSteerRad,
+        maxW,
+        minY,
+        maxY,
+        maxZ,
+        _obsSteer
+      );
+      const nearObstacle = obsProx > 0.05 || hasCollisionPush || f.evadeTimer > 0 || f.evadeLockTimer > 0;
+
+      // Proactive glass-wall U-turn before fish presses against glass edge
+      const probeWallX = f.pos.x + _vec3B.x * 0.54;
+      const probeWallZ = f.pos.z + _vec3B.z * 0.44;
+      const headingIntoWall =
+        Math.abs(probeWallX) > maxW - 0.12 || Math.abs(probeWallZ) > maxZ - 0.12;
+      const atWallEdge = Math.abs(f.pos.x) > maxW - 0.12 || Math.abs(f.pos.z) > maxZ - 0.12;
+      if ((headingIntoWall && (!chasedFood || atWallEdge)) && f.evadeLockTimer <= 0 && f.contactRepickCooldown <= 0) {
+        if (chasedFood) {
+          f.yieldFoodTimer = Math.max(f.yieldFoodTimer, 0.55);
+          f.targetFoodId = null;
+        }
+        const escX = Math.abs(probeWallX) > maxW - 0.16 ? -Math.sign(probeWallX) : -f.pos.x * 0.3;
+        const escZ = Math.abs(probeWallZ) > maxZ - 0.16 ? -Math.sign(probeWallZ) : -f.pos.z * 0.3;
+        this.beginCommittedEscape(f, escX, 0, escZ, 0.95, maxW, minY, maxY, maxZ);
+        _vec3A.copy(f.targetPos).sub(f.pos);
       }
 
-      const hungerDrive = f.satiety < 0.45 ? 1.14 : f.satiety > 1.15 ? 0.88 : 1.0;
+      // Secondary deadlock safety check
+      const targetLen = Math.max(0.001, _vec3A.length());
+      const alignToTarget =
+        (_vec3A.x * _vec3B.x + _vec3A.y * _vec3B.y + _vec3A.z * _vec3B.z) / targetLen;
+      if (hasCollisionPush || atWallEdge || (obsProx > 0.42 && alignToTarget < 0.25)) {
+        f.blockedTime += dt;
+      } else {
+        f.blockedTime = Math.max(0, f.blockedTime - dt * 1.5);
+      }
 
-      // Natural burst-and-coast (tail kick + hydrodynamic glide) cycle when cruising calmly
-      f.burstPhase += dt * (0.72 + (f.baseSpeed - 0.54) * 0.5) * motionScale;
-      const glideWave = 0.5 + 0.5 * Math.sin(f.burstPhase + Math.sin(f.burstPhase * 0.43) * 0.7);
-      const cruiseEffort = 0.36 + 0.84 * Math.pow(glideWave, 1.35);
-      const targetEffort =
-        f.fleeTimer > 0
-          ? 1.55 + (f.fleeTimer / 1.25) * 0.9
-          : chasedFood
-            ? 1.38 * hungerDrive
-            : cruiseEffort * hungerDrive;
-      f.swimEffort += (targetEffort - f.swimEffort) * Math.min(1, dt * (f.fleeTimer > 0 || chasedFood ? 6.5 : 3.2));
+      if (f.blockedTime > 0.24 && f.contactRepickCooldown <= 0) {
+        if (chasedFood) {
+          f.yieldFoodTimer = Math.max(f.yieldFoodTimer, 0.65);
+          f.targetFoodId = null;
+        }
+        const escX = _obsSteer.lengthSq() > 0.01 ? _obsSteer.x : -f.pos.x;
+        const escZ = _obsSteer.lengthSq() > 0.01 ? _obsSteer.z : -f.pos.z;
+        f.blockedTime = 0;
+        this.beginCommittedEscape(f, escX, _obsSteer.y * 0.4, escZ, 1.05, maxW, minY, maxY, maxZ);
+        _vec3A.copy(f.targetPos).sub(f.pos);
+      }
 
-      const desiredSpeed =
-        f.fleeTimer > 0
-          ? f.baseSpeed * (1.25 + (f.fleeTimer / 1.25) * 1.9)
-          : chasedFood
-            ? f.baseSpeed * 1.88 * hungerDrive
-            : f.baseSpeed * hungerDrive * (0.64 + 0.58 * f.swimEffort);
-      f.speed += (desiredSpeed - f.speed) * Math.min(1, dt * (f.fleeTimer > 0 || chasedFood ? 4.4 : 2.6));
+      let desiredYaw: number;
+      let desiredPitch: number;
+      const pitchCap = chasedFood ? 0.62 : 0.48;
 
-      const horizLen = Math.max(0.001, Math.hypot(_vec3A.x, _vec3A.z));
-      const desiredYaw = Math.atan2(-_vec3A.z, _vec3A.x);
-      const pitchCap = chasedFood ? 0.62 : 0.46;
-      const desiredPitch = THREE.MathUtils.clamp(
-        Math.atan2(_vec3A.y, horizLen),
-        -pitchCap,
-        pitchCap
-      );
+      if (f.evadeLockTimer > 0 && f.fleeTimer <= 0) {
+        // Committed smooth escape arc: follow locked escape vector + gentle safety cushion (no reversing!)
+        const evCosP = Math.cos(f.evadePitch);
+        _vec3A.set(
+          Math.cos(f.evadeYaw) * evCosP,
+          Math.sin(f.evadePitch),
+          -Math.sin(f.evadeYaw) * evCosP
+        );
+        _vec3A
+          .addScaledVector(_avoidVec, 0.85)
+          .addScaledVector(_obsSteer, 0.72);
+        const horizLen = Math.max(0.001, Math.hypot(_vec3A.x, _vec3A.z));
+        desiredYaw = Math.atan2(-_vec3A.z, _vec3A.x);
+        desiredPitch = THREE.MathUtils.clamp(Math.atan2(_vec3A.y, horizLen), -pitchCap, pitchCap);
+      } else {
+        if (_avoidVec.lengthSq() > 0.0001 || _obsSteer.lengthSq() > 0.0001) {
+          const fishSteerWeight = chasedFood ? 1.85 : 2.35;
+          const obsSteerWeight = chasedFood ? 2.15 : 2.45;
+          _vec3A
+            .normalize()
+            .addScaledVector(_avoidVec, fishSteerWeight)
+            .addScaledVector(_obsSteer, obsSteerWeight);
+        }
+        const horizLen = Math.max(0.001, Math.hypot(_vec3A.x, _vec3A.z));
+        desiredYaw = Math.atan2(-_vec3A.z, _vec3A.x);
+        desiredPitch = THREE.MathUtils.clamp(Math.atan2(_vec3A.y, horizLen), -pitchCap, pitchCap);
+      }
 
-      // Slow, natural curved U-turn rate (livelier when dodging obstacles or snapping at food)
+      const hovering =
+        f.paceMode === 'hover' &&
+        f.fleeTimer <= 0 &&
+        !chasedFood &&
+        !hasCollisionPush &&
+        obsProx < 0.35;
+
+      // Smooth curved U-turn rate with calm hovering when paused in open water
       const yawDiff = wrapAngle(desiredYaw - f.yaw);
-      const maxYawRate = f.fleeTimer > 0 ? 3.8 : nearObstacle ? 3.4 : chasedFood ? 2.65 : 1.15;
+      const maxYawRate =
+        f.fleeTimer > 0
+          ? 4.0
+          : f.evadeLockTimer > 0
+            ? 3.4
+            : nearObstacle
+              ? 3.0
+              : chasedFood
+                ? 2.75
+                : hovering
+                  ? 0.65
+                  : f.paceMode === 'sprint'
+                    ? 1.95
+                    : 1.45;
       const yawStep = THREE.MathUtils.clamp(
-        yawDiff * (nearObstacle ? 3.5 : chasedFood ? 3.0 : 2.2),
+        yawDiff *
+          (f.evadeLockTimer > 0
+            ? 3.5
+            : nearObstacle
+              ? 3.1
+              : chasedFood
+                ? 3.0
+                : hovering
+                  ? 1.2
+                  : 2.4),
         -maxYawRate,
         maxYawRate
       );
       f.yaw = wrapAngle(f.yaw + yawStep * dt * motionScale);
 
       const pitchDiff = desiredPitch - f.pitch;
-      f.pitch += pitchDiff * Math.min(1, dt * (nearObstacle || chasedFood ? 3.4 : 2.2)) * motionScale;
+      const prevPitch = f.pitch;
+      f.pitch +=
+        pitchDiff *
+        Math.min(1, dt * (nearObstacle || chasedFood ? 3.4 : hovering ? 1.5 : 2.4)) *
+        motionScale;
+      const pitchVel = dt > 1e-4 ? (f.pitch - prevPitch) / dt : 0;
+
+      const hungerDrive = f.satiety < 0.45 ? 1.14 : f.satiety > 1.15 ? 0.88 : 1.0;
+
+      // Maintain smooth glide speed during escape curves, while allowing natural hover/slow/sprint tempos
+      const turnBrake =
+        1.0 - THREE.MathUtils.clamp((Math.abs(yawDiff) - 0.45) / 2.4, 0, 0.36);
+      const obsBrake = f.evadeLockTimer > 0 ? 0.86 : 1.0 - THREE.MathUtils.clamp(obsProx * 0.28, 0, 0.24);
+      const maneuverBrake = Math.min(turnBrake, obsBrake);
+
+      f.burstPhase += dt * (0.72 + (f.baseSpeed - 0.54) * 0.5) * motionScale;
+      const glideWave = 0.5 + 0.5 * Math.sin(f.burstPhase + Math.sin(f.burstPhase * 0.43) * 0.7);
+      const paceMicroWave = 0.88 + 0.24 * Math.pow(glideWave, 1.25);
+      const cruiseEffort = f.paceEffortMul * paceMicroWave;
+      const targetEffort =
+        f.fleeTimer > 0
+          ? 1.65 + (f.fleeTimer / 1.25) * 0.9
+          : chasedFood
+            ? 1.42 * hungerDrive
+            : f.evadeLockTimer > 0 && !hovering
+              ? Math.max(0.95, f.paceEffortMul)
+              : cruiseEffort * hungerDrive * (hovering ? 1.0 : 0.78 + 0.22 * maneuverBrake);
+      f.swimEffort +=
+        (targetEffort - f.swimEffort) *
+        Math.min(1, dt * (f.fleeTimer > 0 || chasedFood ? 6.5 : f.paceMode === 'sprint' ? 5.2 : 3.2));
+
+      const rawCruiseSpeed = f.baseSpeed * hungerDrive * f.paceSpeedMul * paceMicroWave * maneuverBrake;
+      const minObstacleFloor = nearObstacle || obsProx > 0.25 ? f.baseSpeed * 0.38 : 0.02;
+      const desiredSpeed =
+        f.fleeTimer > 0
+          ? f.baseSpeed * (1.35 + (f.fleeTimer / 1.25) * 1.95)
+          : chasedFood
+            ? f.baseSpeed * 1.88 * hungerDrive * Math.max(0.55, turnBrake)
+            : Math.max(minObstacleFloor, rawCruiseSpeed);
+      f.speed +=
+        (desiredSpeed - f.speed) *
+        Math.min(1, dt * (f.fleeTimer > 0 || chasedFood ? 4.8 : hovering ? 4.2 : 3.2));
 
       const targetRoll = THREE.MathUtils.clamp(-yawStep * 0.28, -0.34, 0.34);
-      f.roll += (targetRoll - f.roll) * Math.min(1, dt * 4.0);
+      f.roll += (targetRoll - f.roll) * Math.min(1, dt * 4.2);
 
       f.bobPhase += f.bobFreq * dt * motionScale;
       const bobY = Math.sin(f.bobPhase) * f.bobAmp * motionScale;
@@ -3183,9 +4043,16 @@ void main() {
         -Math.sin(f.yaw) * cosP
       );
       f.pos.addScaledVector(_vec3B, f.speed * dt * motionScale);
+      f.pos.x += f.evadeVx * dt * motionScale;
+      f.pos.y += f.evadeVy * dt * motionScale;
+      f.pos.z += f.evadeVz * dt * motionScale;
 
       f.pos.x = THREE.MathUtils.clamp(f.pos.x, -maxW, maxW);
-      f.pos.y = THREE.MathUtils.clamp(f.pos.y, minY, maxY);
+      f.pos.y = THREE.MathUtils.clamp(
+        f.pos.y,
+        minY,
+        chasedFood ? this.tankWaterTopY - 0.14 : maxY
+      );
       f.pos.z = THREE.MathUtils.clamp(f.pos.z, -maxZ, maxZ);
 
       // Strictly keep snout, belly/pelvic fins, and tail above the sandbed & emit visible sand + dust
@@ -3246,15 +4113,55 @@ void main() {
 
       const chompBoost = f.chompTimer > 0 ? 1.45 : 1.0;
       const speedNorm = f.speed / Math.max(0.01, f.baseSpeed);
-      // Spine wave frequency accelerates on kicks & coasts slower during glide
-      f.swimPhase += dt * (3.1 + f.swimEffort * 4.6 + speedNorm * 1.4) * chompBoost * motionScale;
-      // Pectoral sculling is more active during slow glides, hovering, and turns
-      const scullRate = 2.6 + (1.4 - Math.min(1.1, f.swimEffort * 0.55)) * 1.6 + Math.min(1.5, Math.abs(yawStep));
+      // Spine wave frequency accelerates on kicks & coasts gently during slow glides / hovering
+      f.swimPhase += dt * (2.2 + f.swimEffort * 4.8 + speedNorm * 1.5) * chompBoost * motionScale;
+      // Pectoral sculling stays lively during hovering ("medio parado") to tread water & stabilize
+      const scullRate =
+        (hovering ? 3.8 : 2.6) +
+        (1.4 - Math.min(1.1, f.swimEffort * 0.55)) * 1.6 +
+        Math.min(1.8, Math.abs(yawStep) + (1 - maneuverBrake) * 2.2);
       f.scullPhase += dt * scullRate * motionScale;
-      f.breathPhase += dt * (2.3 + Math.min(2.2, f.swimEffort * 1.1)) * motionScale;
+      f.breathPhase += dt * (2.65 + Math.min(2.4, f.swimEffort * 1.15)) * motionScale;
 
-      const targetBend = THREE.MathUtils.clamp(-yawStep * 0.22, -0.34, 0.34);
-      f.turnBendSmooth += (targetBend - f.turnBendSmooth) * Math.min(1, dt * 5.2);
+      // Stronger, organic lateral C-bend on turns + gentle sinuous S-glide during calm swimming
+      const idleSway = Math.sin(f.archPhase * 0.72 + 1.0) * 0.145;
+      const targetBend = THREE.MathUtils.clamp(-yawStep * 0.50 + idleSway, -0.62, 0.62);
+      f.turnBendSmooth += (targetBend - f.turnBendSmooth) * Math.min(1, dt * 6.0);
+
+      // Independent expressive head movement (up/down pitch + curious glance yaw) & full-body spine arch
+      const nearSandBias = sandCheck.minClearance < 0.28 ? -0.105 : 0;
+      const foodLookBias =
+        chasedFood ? THREE.MathUtils.clamp((chasedFood.pos.y - f.pos.y) * 0.36, -0.18, 0.22) : 0;
+      const curiosityLift =
+        Math.sin(f.curiosityPhase) * 0.185 +
+        Math.sin(f.curiosityPhase * 2.15 + 0.9) * 0.068;
+      const targetHeadPitch = THREE.MathUtils.clamp(
+        pitchDiff * 0.70 + curiosityLift + nearSandBias + foodLookBias,
+        -0.32,
+        0.32
+      );
+      f.headPitchCur += (targetHeadPitch - f.headPitchCur) * Math.min(1, dt * 6.2);
+
+      const targetHeadYaw = THREE.MathUtils.clamp(
+        yawDiff * 0.32 + Math.cos(f.curiosityPhase * 0.95) * 0.11,
+        -0.24,
+        0.24
+      );
+      f.headYawCur += (targetHeadYaw - f.headYawCur) * Math.min(1, dt * 6.2);
+
+      // Unmistakable full-body dorsoventral spine arching (during climbs, dives, AND continuous organic flexing)
+      const livingSpineFlex =
+        Math.sin(f.archPhase) * 0.215 + Math.sin(f.archPhase * 1.65 + 0.7) * 0.072;
+      const targetPitchArch = THREE.MathUtils.clamp(
+        pitchDiff * 0.88 +
+          pitchVel * 0.25 +
+          f.pitch * 0.32 +
+          livingSpineFlex +
+          nearSandBias * 0.95,
+        -0.44,
+        0.44
+      );
+      f.pitchArchCur += (targetPitchArch - f.pitchArchCur) * Math.min(1, dt * 5.2);
 
       const chompRatio = f.chompTimer > 0 ? Math.sin((f.chompTimer / 0.32) * Math.PI) : 0;
       updateFishSkeleton(f.rig, this.elapsedTime, {
@@ -3265,6 +4172,9 @@ void main() {
         speedNorm,
         yawRate: yawStep,
         pitchAngle: f.pitch,
+        headPitch: f.headPitchCur,
+        headYaw: f.headYawCur,
+        pitchArch: f.pitchArchCur,
         chompRatio,
         motionScale,
         turnBendSmooth: f.turnBendSmooth,
@@ -3275,7 +4185,8 @@ void main() {
       this.saveState();
     }
 
-    // Strict 3D spine-segment collision separation: fish-to-fish AND fish-to-plants/stones
+    // Strict 3D spine-segment collision separation: fish-to-fish AND fish-to-stones
+    // Triggers committed open-water escape arcs & food-chase yielding so collisions NEVER stutter
     const fishCount = this.fishList.length;
     for (let iter = 0; iter < 2; iter++) {
       if (fishCount > 1) {
@@ -3323,14 +4234,14 @@ void main() {
                 const angle = (i * 2.17 + j * 1.31) % (Math.PI * 2);
                 _sepDiff.set(Math.cos(angle), 0.18, Math.sin(angle)).normalize();
               }
-              const push = (minSep - dist) * 0.52;
+              const push = (minSep - dist) * 0.46;
               fa.pos.addScaledVector(_sepDiff, push);
               fb.pos.addScaledVector(_sepDiff, -push);
 
               fa.pos.x = THREE.MathUtils.clamp(fa.pos.x, -maxW, maxW);
               fa.pos.y = THREE.MathUtils.clamp(
                 fa.pos.y,
-                Math.max(minY, sandHeightAt(fa.pos.x, fa.pos.z) + 0.13),
+                Math.max(minY, this.sandY(fa.pos.x, fa.pos.z) + 0.13),
                 maxY
               );
               fa.pos.z = THREE.MathUtils.clamp(fa.pos.z, -maxZ, maxZ);
@@ -3338,10 +4249,98 @@ void main() {
               fb.pos.x = THREE.MathUtils.clamp(fb.pos.x, -maxW, maxW);
               fb.pos.y = THREE.MathUtils.clamp(
                 fb.pos.y,
-                Math.max(minY, sandHeightAt(fb.pos.x, fb.pos.z) + 0.13),
+                Math.max(minY, this.sandY(fb.pos.x, fb.pos.z) + 0.13),
                 maxY
               );
               fb.pos.z = THREE.MathUtils.clamp(fb.pos.z, -maxZ, maxZ);
+
+              if (iter === 0) {
+                const tx = -_sepDiff.z;
+                const tz = _sepDiff.x;
+                const vertSplit = fa.id < fb.id ? 0.16 : -0.16;
+
+                fa.pushSteerX += _sepDiff.x * 1.15 + tx * 0.95;
+                fa.pushSteerY += _sepDiff.y * 0.8 + vertSplit * 2.4;
+                fa.pushSteerZ += _sepDiff.z * 1.15 + tz * 0.95;
+                fa.evadeVx = THREE.MathUtils.clamp(fa.evadeVx + (_sepDiff.x * 0.22 + tx * 0.34), -0.5, 0.5);
+                fa.evadeVy = THREE.MathUtils.clamp(fa.evadeVy + vertSplit, -0.32, 0.32);
+                fa.evadeVz = THREE.MathUtils.clamp(fa.evadeVz + (_sepDiff.z * 0.22 + tz * 0.34), -0.5, 0.5);
+
+                fb.pushSteerX += -_sepDiff.x * 1.15 - tx * 0.95;
+                fb.pushSteerY += -_sepDiff.y * 0.8 - vertSplit * 2.4;
+                fb.pushSteerZ += -_sepDiff.z * 1.15 - tz * 0.95;
+                fb.evadeVx = THREE.MathUtils.clamp(fb.evadeVx - (_sepDiff.x * 0.22 + tx * 0.34), -0.5, 0.5);
+                fb.evadeVy = THREE.MathUtils.clamp(fb.evadeVy - vertSplit, -0.32, 0.32);
+                fb.evadeVz = THREE.MathUtils.clamp(fb.evadeVz - (_sepDiff.z * 0.22 + tz * 0.34), -0.5, 0.5);
+
+                // Asymmetric speed / pause ("medio parado") reaction when two fish touch each other
+                let hoverFishA = false;
+                let hoverFishB = false;
+                if (fa.touchSpeedCooldown <= 0 && fb.touchSpeedCooldown <= 0) {
+                  fa.touchSpeedCooldown = 1.2;
+                  fb.touchSpeedCooldown = 1.2;
+                  const firstYields = Math.random() < 0.5;
+                  const reactionRoll = Math.random();
+                  if (reactionRoll < 0.45) {
+                    if (firstYields) {
+                      this.assignFishPace(fa, 'hover', 1.0 + Math.random() * 0.75);
+                      this.assignFishPace(fb, 'sprint', 1.05 + Math.random() * 0.55);
+                      hoverFishA = true;
+                    } else {
+                      this.assignFishPace(fb, 'hover', 1.0 + Math.random() * 0.75);
+                      this.assignFishPace(fa, 'sprint', 1.05 + Math.random() * 0.55);
+                      hoverFishB = true;
+                    }
+                  } else if (reactionRoll < 0.76) {
+                    if (firstYields) {
+                      this.assignFishPace(fa, 'slow', 1.3 + Math.random() * 0.85);
+                      this.assignFishPace(fb, 'sprint', 1.0 + Math.random() * 0.55);
+                    } else {
+                      this.assignFishPace(fb, 'slow', 1.3 + Math.random() * 0.85);
+                      this.assignFishPace(fa, 'sprint', 1.0 + Math.random() * 0.55);
+                    }
+                  } else {
+                    this.assignFishPace(fa, 'sprint', 0.9 + Math.random() * 0.5);
+                    this.assignFishPace(fb, 'sprint', 1.1 + Math.random() * 0.55);
+                  }
+                }
+
+                // Yield food chase briefly if two fish collide while rushing food so they don't nose-butt repeatedly
+                if (fa.targetFoodId && fb.targetFoodId && fa.targetFoodId === fb.targetFoodId) {
+                  const dA = fa.pos.distanceToSquared(fa.targetPos);
+                  const dB = fb.pos.distanceToSquared(fb.targetPos);
+                  if (dA > dB) {
+                    fa.yieldFoodTimer = Math.max(fa.yieldFoodTimer, 0.85);
+                    fa.targetFoodId = null;
+                  } else {
+                    fb.yieldFoodTimer = Math.max(fb.yieldFoodTimer, 0.85);
+                    fb.targetFoodId = null;
+                  }
+                }
+
+                this.beginCommittedEscape(
+                  fa,
+                  _sepDiff.x + tx * 0.7,
+                  vertSplit,
+                  _sepDiff.z + tz * 0.7,
+                  hoverFishA ? 0.42 : 0.85,
+                  maxW,
+                  minY,
+                  maxY,
+                  maxZ
+                );
+                this.beginCommittedEscape(
+                  fb,
+                  -_sepDiff.x - tx * 0.7,
+                  -vertSplit,
+                  -_sepDiff.z - tz * 0.7,
+                  hoverFishB ? 0.42 : 0.85,
+                  maxW,
+                  minY,
+                  maxY,
+                  maxZ
+                );
+              }
             }
           }
         }
@@ -3361,7 +4360,7 @@ void main() {
     for (const f of this.fishList) {
       const bobY = Math.sin(f.bobPhase) * f.bobAmp * motionScale;
       const chompNod =
-        f.chompTimer > 0 ? Math.sin((f.chompTimer / 0.32) * Math.PI * 2) * 0.12 : 0;
+        f.chompTimer > 0 ? Math.sin((f.chompTimer / 0.32) * Math.PI * 2) * 0.028 : 0;
       const sc = f.baseScale * f.spawnScale;
       const cond = computeFishConditionScales(f.visualSatiety);
 
@@ -3413,8 +4412,8 @@ void main() {
       this.airstoneTimer = 0.11 + Math.random() * 0.14;
     }
 
-    const bubbleMaxX = TANK_W * 0.5 - 0.16;
-    const bubbleMaxZ = TANK_D * 0.5 - 0.16;
+    const bubbleMaxX = this.tankDims.width * 0.5 - 0.16;
+    const bubbleMaxZ = this.tankDims.depth * 0.5 - 0.16;
     const damp = Math.exp(-2.8 * dt);
     for (const b of this.bubbles) {
       if (!b.active) continue;
@@ -3470,7 +4469,7 @@ void main() {
         (b.radius / b.xzRatio) * (1 + sq1 * 0.45 - sq2)
       );
 
-      if (b.pos.y > TANK_WATER_TOP_Y - 0.03) {
+      if (b.pos.y > this.tankWaterTopY - 0.03) {
         if (b.radius > 0.015) {
           this.tank?.triggerSurfaceWave(
             b.pos.x,
@@ -3491,8 +4490,8 @@ void main() {
 
       const posAttr = this.motesPoints.geometry.attributes.position as THREE.BufferAttribute;
       const arr = posAttr.array as Float32Array;
-      const mMaxX = TANK_W * 0.5 - 0.24;
-      const mMaxZ = TANK_D * 0.5 - 0.24;
+      const mMaxX = this.tankDims.width * 0.5 - 0.24;
+      const mMaxZ = this.tankDims.depth * 0.5 - 0.24;
       const airPos = this.tank?.airstoneTop;
 
       for (let i = 0; i < this.motesCount; i++) {
@@ -3526,8 +4525,9 @@ void main() {
         else if (mx < -mMaxX) mx = mMaxX - 0.05;
         if (mz > mMaxZ) mz = -mMaxZ + 0.05;
         else if (mz < -mMaxZ) mz = mMaxZ - 0.05;
-        if (my > TANK_WATER_TOP_Y - 0.08) my = -0.92;
-        else if (my < -1.0) my = TANK_WATER_TOP_Y - 0.14;
+        const mFloorY = this.tankSandBaseY + 0.16;
+        if (my > this.tankWaterTopY - 0.08) my = mFloorY + 0.06;
+        else if (my < mFloorY) my = this.tankWaterTopY - 0.14;
 
         arr[ix] = mx;
         arr[ix + 1] = my;
@@ -3543,8 +4543,8 @@ void main() {
 
       const detPosAttr = this.detritusPoints.geometry.attributes.position as THREE.BufferAttribute;
       const dArr = detPosAttr.array as Float32Array;
-      const dMaxX = TANK_W * 0.5 - 0.24;
-      const dMaxZ = TANK_D * 0.5 - 0.24;
+      const dMaxX = this.tankDims.width * 0.5 - 0.24;
+      const dMaxZ = this.tankDims.depth * 0.5 - 0.24;
       const airPos = this.tank?.airstoneTop;
 
       for (let i = 0; i < this.detritusCount; i++) {
@@ -3580,11 +4580,11 @@ void main() {
         if (dz > dMaxZ) dz = -dMaxZ + 0.06;
         else if (dz < -dMaxZ) dz = dMaxZ - 0.06;
 
-        const floorHere = sandHeightAt(dx, dz) + 0.02;
+        const floorHere = this.sandY(dx, dz) + 0.02;
         if (dy < floorHere) {
           // Resuspend gently from top or updraft
-          dy = TANK_WATER_TOP_Y - 0.14 - Math.random() * 0.18;
-        } else if (dy > TANK_WATER_TOP_Y - 0.07) {
+          dy = this.tankWaterTopY - 0.14 - Math.random() * 0.18;
+        } else if (dy > this.tankWaterTopY - 0.07) {
           dy = floorHere + 0.08 + Math.random() * 0.25;
         }
 
@@ -3630,8 +4630,16 @@ void main() {
         slot.vz = slot.vz * drag + (slot.x * 0.011) * dt;
         slot.vy = slot.vy * drag - 0.14 * dt;
 
-        slot.x = THREE.MathUtils.clamp(slot.x + slot.vx * dt * motionScale, -TANK_W * 0.48, TANK_W * 0.48);
-        slot.z = THREE.MathUtils.clamp(slot.z + slot.vz * dt * motionScale, -TANK_D * 0.48, TANK_D * 0.48);
+        slot.x = THREE.MathUtils.clamp(
+          slot.x + slot.vx * dt * motionScale,
+          -this.tankDims.width * 0.48,
+          this.tankDims.width * 0.48
+        );
+        slot.z = THREE.MathUtils.clamp(
+          slot.z + slot.vz * dt * motionScale,
+          -this.tankDims.depth * 0.48,
+          this.tankDims.depth * 0.48
+        );
         slot.y += slot.vy * dt * motionScale;
         if (slot.y < slot.floorY) {
           slot.y = slot.floorY;
@@ -3691,8 +4699,16 @@ void main() {
         g.vz *= gDrag;
         g.vy = g.vy * gDrag - 0.92 * dt;
 
-        g.x = THREE.MathUtils.clamp(g.x + g.vx * dt * motionScale, -TANK_W * 0.48, TANK_W * 0.48);
-        g.z = THREE.MathUtils.clamp(g.z + g.vz * dt * motionScale, -TANK_D * 0.48, TANK_D * 0.48);
+        g.x = THREE.MathUtils.clamp(
+          g.x + g.vx * dt * motionScale,
+          -this.tankDims.width * 0.48,
+          this.tankDims.width * 0.48
+        );
+        g.z = THREE.MathUtils.clamp(
+          g.z + g.vz * dt * motionScale,
+          -this.tankDims.depth * 0.48,
+          this.tankDims.depth * 0.48
+        );
         g.y += g.vy * dt * motionScale;
         if (g.y <= g.floorY) {
           g.y = g.floorY;

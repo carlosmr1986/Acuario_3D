@@ -7,6 +7,8 @@ export interface WaterFogUniforms {
   uMotionAmp: { value: number };
   uCausticIntensity: { value: number };
   uSunColor: { value: THREE.Color };
+  uTankMin: { value: THREE.Vector3 };
+  uTankMax: { value: THREE.Vector3 };
 }
 
 export function createWaterFogUniforms(): WaterFogUniforms {
@@ -17,6 +19,8 @@ export function createWaterFogUniforms(): WaterFogUniforms {
     uMotionAmp: { value: 1.0 },
     uCausticIntensity: { value: 1.0 },
     uSunColor: { value: new THREE.Color(0xfff1d6) },
+    uTankMin: { value: new THREE.Vector3(-2.7, -1.55, -1.5) },
+    uTankMax: { value: new THREE.Vector3(2.7, 1.32, 1.5) },
   };
 }
 
@@ -35,7 +39,7 @@ export function applyWaterDepthFog(
   const prevKey = material.customProgramCacheKey;
 
   material.customProgramCacheKey = () =>
-    `${prevKey ? prevKey.call(material) : 'std'}-waterfog-${densityScale.toFixed(2)}-c${causticStrength.toFixed(2)}`;
+    `${prevKey ? prevKey.call(material) : 'std'}-waterfog-v2-${densityScale.toFixed(2)}-c${causticStrength.toFixed(2)}`;
 
   material.onBeforeCompile = (shader, renderer) => {
     if (prevCompile) {
@@ -44,6 +48,8 @@ export function applyWaterDepthFog(
 
     shader.uniforms.uWaterColor = uniforms.uWaterColor;
     shader.uniforms.uWaterDensity = uniforms.uWaterDensity;
+    shader.uniforms.uTankMin = uniforms.uTankMin;
+    shader.uniforms.uTankMax = uniforms.uTankMax;
 
     const useCaustics = causticStrength > 0.001;
     if (useCaustics) {
@@ -84,7 +90,7 @@ float wC1 = sin(wUvC.x * 2.1 + wTc + cos(wUvC.y * 1.9 - wTc * 0.8));
 float wC2 = cos(wUvC.y * 2.4 - wTc * 1.1 + sin(wUvC.x * 2.2 + wTc * 0.7));
 float wCaustic = pow(max(0.0001, 1.0 - abs(wC1 + wC2) * 0.65), 3.3);
 float wUpMask = smoothstep(-0.15, 0.78, vWaterWorldNormal.y);
-float wHeightMask = mix(0.52, 1.15, clamp((vWaterWorldPos.y + 1.15) / 2.45, 0.0, 1.0));
+float wHeightMask = mix(0.52, 1.15, clamp((vWaterWorldPos.y - uTankMin.y) / max(0.5, uTankMax.y - uTankMin.y), 0.0, 1.0));
 gl_FragColor.rgb += uWfSunColor * vec3(0.24, 0.42, 0.46) * wCaustic * wUpMask * wHeightMask * ${causticStrength.toFixed(3)} * uWfCausticIntensity;
 `
       : '';
@@ -92,6 +98,8 @@ gl_FragColor.rgb += uWfSunColor * vec3(0.24, 0.42, 0.46) * wCaustic * wUpMask * 
     const fragUniforms = useCaustics
       ? `uniform vec3 uWaterColor;
 uniform float uWaterDensity;
+uniform vec3 uTankMin;
+uniform vec3 uTankMax;
 uniform float uWfTime;
 uniform float uWfMotionAmp;
 uniform float uWfCausticIntensity;
@@ -100,6 +108,8 @@ varying vec3 vWaterWorldPos;
 varying vec3 vWaterWorldNormal;`
       : `uniform vec3 uWaterColor;
 uniform float uWaterDensity;
+uniform vec3 uTankMin;
+uniform vec3 uTankMax;
 varying vec3 vWaterWorldPos;`;
 
     shader.fragmentShader = shader.fragmentShader
@@ -119,8 +129,8 @@ vec3 wSafeDir = vec3(
   abs(wDir.z) < 0.0001 ? 0.0001 : wDir.z
 );
 vec3 wInvDir = 1.0 / wSafeDir;
-vec3 wT0 = (vec3(-2.70, -1.55, -1.50) - cameraPosition) * wInvDir;
-vec3 wT1 = (vec3( 2.70,  1.32,  1.50) - cameraPosition) * wInvDir;
+vec3 wT0 = (uTankMin - cameraPosition) * wInvDir;
+vec3 wT1 = (uTankMax - cameraPosition) * wInvDir;
 vec3 wTMin = min(wT0, wT1);
 float wEnter = max(max(wTMin.x, wTMin.y), max(wTMin.z, 0.0));
 float wDist = max(0.0, wSegLen - wEnter);

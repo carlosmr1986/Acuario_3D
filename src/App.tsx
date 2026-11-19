@@ -1,7 +1,8 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownToLine,
   ArrowUpToLine,
+  Box,
   Check,
   Compass,
   Cookie,
@@ -17,11 +18,68 @@ import { AquariumCanvas, type AquariumCanvasHandle } from './components/Aquarium
 import { BottomDock } from './components/BottomDock';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAControls';
 import type {
+  AquariumBackgroundId,
   AquariumCounts,
   AquariumLighting,
   LightingPreset,
   SelectedDecor,
+  TankDimensions,
 } from './types/aquarium';
+
+const DEFAULT_TANK_DIMENSIONS: TankDimensions = {
+  preset: 'standard',
+  width: 5.4,
+  height: 3.2,
+  depth: 3.0,
+};
+
+const TANK_SIZE_PRESETS: {
+  id: Exclude<TankDimensions['preset'], 'custom'>;
+  label: string;
+  dims: Omit<TankDimensions, 'preset'>;
+}[] = [
+  { id: 'compact', label: 'Compacta', dims: { width: 4.0, height: 2.8, depth: 2.4 } },
+  { id: 'standard', label: 'Estándar', dims: { width: 5.4, height: 3.2, depth: 3.0 } },
+  { id: 'large', label: 'Grande', dims: { width: 6.6, height: 3.6, depth: 3.5 } },
+  { id: 'panoramic', label: 'Panorámica', dims: { width: 7.4, height: 3.0, depth: 2.8 } },
+];
+
+const BACKGROUND_OPTIONS: {
+  id: AquariumBackgroundId;
+  label: string;
+  swatchStyle: string;
+}[] = [
+  {
+    id: 'natural',
+    label: 'Natural',
+    swatchStyle: 'linear-gradient(180deg, #1b7ea6 0%, #0b4a69 55%, #06273f 100%)',
+  },
+  {
+    id: 'reef',
+    label: 'Arrecife',
+    swatchStyle: 'linear-gradient(180deg, #3ad1ec 0%, #1089b8 55%, #042a47 100%)',
+  },
+  {
+    id: 'amazon',
+    label: 'Amazónico',
+    swatchStyle: 'linear-gradient(180deg, #4d926b 0%, #1f533e 58%, #071b16 100%)',
+  },
+  {
+    id: 'slate',
+    label: 'Pizarra',
+    swatchStyle: 'linear-gradient(180deg, #324050 0%, #1b232e 58%, #0d1219 100%)',
+  },
+  {
+    id: 'frosted',
+    label: 'Esmerilado',
+    swatchStyle: 'linear-gradient(180deg, #f2fbff 0%, #c6e8f7 55%, #69a5c7 100%)',
+  },
+  {
+    id: 'abyss',
+    label: 'Abismo',
+    swatchStyle: 'linear-gradient(180deg, #1863a8 0%, #0b3a72 58%, #020b1d 100%)',
+  },
+];
 
 const LIGHTING_OPTIONS: {
   id: LightingPreset;
@@ -74,6 +132,19 @@ export default function App() {
     intensity: 1.0,
   });
   const [lightingOpen, setLightingOpen] = useState(false);
+  const [tankDimensions, setTankDimensions] = useState<TankDimensions>(
+    DEFAULT_TANK_DIMENSIONS
+  );
+  const [backgroundId, setBackgroundId] = useState<AquariumBackgroundId>('natural');
+  const [tankPanelOpen, setTankPanelOpen] = useState(false);
+
+  const tankMetrics = useMemo(() => {
+    const wCm = Math.round(tankDimensions.width * 15);
+    const hCm = Math.round(tankDimensions.height * 15);
+    const dCm = Math.round(tankDimensions.depth * 15);
+    const liters = Math.round((wCm * hCm * dCm) / 1000);
+    return { wCm, hCm, dCm, liters };
+  }, [tankDimensions]);
 
   const handleCountsChange = useCallback((nextCounts: AquariumCounts) => {
     setCounts(nextCounts);
@@ -83,6 +154,7 @@ export default function App() {
     setSelectedDecor(nextSelected);
     if (nextSelected) {
       setLightingOpen(false);
+      setTankPanelOpen(false);
     }
   }, []);
 
@@ -113,15 +185,40 @@ export default function App() {
     setLightingOpen((prev) => {
       const nextOpen = !prev;
       if (nextOpen) {
+        setTankPanelOpen(false);
         aquariumRef.current?.clearSelection();
       }
       return nextOpen;
     });
   }, []);
 
+  const handleToggleTankPanel = useCallback(() => {
+    setTankPanelOpen((prev) => {
+      const nextOpen = !prev;
+      if (nextOpen) {
+        setLightingOpen(false);
+        aquariumRef.current?.clearSelection();
+      }
+      return nextOpen;
+    });
+  }, []);
+
+  const applyTankDimensions = useCallback((next: TankDimensions) => {
+    setTankDimensions(next);
+    aquariumRef.current?.setTankDimensions(next);
+  }, []);
+
+  const handleSelectBackground = useCallback((id: AquariumBackgroundId) => {
+    setBackgroundId(id);
+    aquariumRef.current?.setBackground(id);
+  }, []);
+
   const handleReset = useCallback(() => {
     setLightingOpen(false);
+    setTankPanelOpen(false);
     setLighting({ preset: 'day', intensity: 1.0 });
+    setTankDimensions(DEFAULT_TANK_DIMENSIONS);
+    setBackgroundId('natural');
     aquariumRef.current?.reset();
   }, []);
 
@@ -137,7 +234,7 @@ export default function App() {
             aria-live="polite"
             className="hidden sm:flex items-center gap-1.5 text-xs text-sky-100/90 tabular-nums whitespace-nowrap truncate drop-shadow-sm"
           >
-            <span>{counts.fish === 1 ? '1 pez' : `${counts.fish} peces`}</span>
+            <span>{counts.fish === 1 ? '1 goldfish' : `${counts.fish} goldfish`}</span>
             <span aria-hidden="true">·</span>
             <span>{counts.plants === 1 ? '1 planta' : `${counts.plants} plantas`}</span>
             <span aria-hidden="true">·</span>
@@ -149,7 +246,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => aquariumRef.current?.dropFood()}
-            aria-label="Echar comida a los peces"
+            aria-label="Echar comida a los goldfish"
             className="min-h-[38px] sm:min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium text-amber-100 bg-amber-600/85 hover:bg-amber-500 active:scale-[0.94] border border-amber-300/45 transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0"
           >
             <Cookie className="w-3.5 h-3.5 text-amber-100 shrink-0" aria-hidden="true" />
@@ -173,6 +270,26 @@ export default function App() {
               <Pencil className="w-3.5 h-3.5 text-sky-300 shrink-0" aria-hidden="true" />
             )}
             <span>{editMode ? 'Listo' : 'Editar'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleToggleTankPanel}
+            aria-label="Tamaño y fondo de la pecera"
+            aria-expanded={tankPanelOpen}
+            className={`min-h-[38px] sm:min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium active:scale-[0.96] border transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer whitespace-nowrap shrink-0 ${
+              tankPanelOpen
+                ? 'bg-sky-500 text-white border-sky-300/70'
+                : 'text-sky-100 bg-slate-950/85 hover:bg-slate-950/95 border-white/20'
+            }`}
+          >
+            <Box
+              className={`w-3.5 h-3.5 shrink-0 ${
+                tankPanelOpen ? 'text-white' : 'text-cyan-300'
+              }`}
+              aria-hidden="true"
+            />
+            <span className="hidden sm:inline">Pecera</span>
           </button>
 
           <button
@@ -228,8 +345,169 @@ export default function App() {
           onCountsChange={handleCountsChange}
           onSelectionChange={handleSelectionChange}
           onLightingLoaded={setLighting}
+          onTankDimensionsLoaded={setTankDimensions}
+          onBackgroundLoaded={setBackgroundId}
         />
       </main>
+
+      {/* Contextual tank size & aquarium background controls */}
+      {tankPanelOpen && (!editMode || !selectedDecor) && (
+        <div
+          role="region"
+          aria-label="Tamaño y fondo de la pecera"
+          className={`fixed left-0 right-0 z-30 flex justify-center px-3 pointer-events-none ${
+            editMode ? 'bottom-[88px] sm:bottom-[84px]' : 'bottom-4 pb-safe'
+          }`}
+        >
+          <div className="pointer-events-auto w-full max-w-lg flex flex-col gap-3 p-3 rounded-xl bg-slate-950/92 border border-white/25 shadow-lg text-white">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-baseline gap-2 min-w-0">
+                <span className="text-xs font-semibold text-white whitespace-nowrap">
+                  Tamaño de pecera
+                </span>
+                <span className="text-[11px] font-medium text-sky-200/90 tabular-nums whitespace-nowrap">
+                  {tankMetrics.wCm} × {tankMetrics.hCm} × {tankMetrics.dCm} cm · ~{tankMetrics.liters} L
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setTankPanelOpen(false)}
+                aria-label="Cerrar controles de la pecera"
+                className="min-h-[36px] min-w-[36px] rounded-lg flex items-center justify-center bg-white/5 hover:bg-white/15 active:scale-[0.96] text-slate-300 hover:text-white transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white cursor-pointer shrink-0"
+              >
+                <X className="w-4 h-4" aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+              {TANK_SIZE_PRESETS.map((preset) => {
+                const active = tankDimensions.preset === preset.id;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() =>
+                      applyTankDimensions({
+                        preset: preset.id,
+                        ...preset.dims,
+                      })
+                    }
+                    aria-pressed={active}
+                    className={`min-h-[36px] px-2 py-1.5 rounded-lg text-xs font-medium active:scale-[0.96] transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 cursor-pointer whitespace-nowrap ${
+                      active
+                        ? 'bg-sky-500 text-white shadow-sm'
+                        : 'bg-white/10 hover:bg-white/20 text-slate-100'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="grid grid-cols-3 gap-2.5 px-0.5">
+              <label className="flex flex-col gap-1">
+                <span className="flex items-center justify-between text-[11px] text-sky-100/90">
+                  <span>Ancho</span>
+                  <span className="tabular-nums text-sky-200">{tankMetrics.wCm} cm</span>
+                </span>
+                <input
+                  type="range"
+                  min={360}
+                  max={760}
+                  step={10}
+                  value={Math.round(tankDimensions.width * 100)}
+                  onChange={(e) =>
+                    applyTankDimensions({
+                      ...tankDimensions,
+                      preset: 'custom',
+                      width: Number(e.target.value) / 100,
+                    })
+                  }
+                  aria-label="Ancho de la pecera"
+                  className="w-full accent-sky-400 cursor-pointer h-2"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="flex items-center justify-between text-[11px] text-sky-100/90">
+                  <span>Alto</span>
+                  <span className="tabular-nums text-sky-200">{tankMetrics.hCm} cm</span>
+                </span>
+                <input
+                  type="range"
+                  min={240}
+                  max={400}
+                  step={10}
+                  value={Math.round(tankDimensions.height * 100)}
+                  onChange={(e) =>
+                    applyTankDimensions({
+                      ...tankDimensions,
+                      preset: 'custom',
+                      height: Number(e.target.value) / 100,
+                    })
+                  }
+                  aria-label="Alto de la pecera"
+                  className="w-full accent-sky-400 cursor-pointer h-2"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="flex items-center justify-between text-[11px] text-sky-100/90">
+                  <span>Fondo</span>
+                  <span className="tabular-nums text-sky-200">{tankMetrics.dCm} cm</span>
+                </span>
+                <input
+                  type="range"
+                  min={220}
+                  max={420}
+                  step={10}
+                  value={Math.round(tankDimensions.depth * 100)}
+                  onChange={(e) =>
+                    applyTankDimensions({
+                      ...tankDimensions,
+                      preset: 'custom',
+                      depth: Number(e.target.value) / 100,
+                    })
+                  }
+                  aria-label="Profundidad de la pecera"
+                  className="w-full accent-sky-400 cursor-pointer h-2"
+                />
+              </label>
+            </div>
+
+            <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
+              <span className="text-xs font-semibold text-white">Fondo del acuario</span>
+              <div className="grid grid-cols-3 gap-1.5">
+                {BACKGROUND_OPTIONS.map((bg) => {
+                  const active = backgroundId === bg.id;
+                  return (
+                    <button
+                      key={bg.id}
+                      type="button"
+                      onClick={() => handleSelectBackground(bg.id)}
+                      aria-pressed={active}
+                      className={`min-h-[38px] px-2 py-1.5 rounded-lg flex items-center gap-1.5 text-[11px] font-medium active:scale-[0.96] border transition-all duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 cursor-pointer whitespace-nowrap ${
+                        active
+                          ? 'bg-sky-500/25 border-sky-400 text-white'
+                          : 'bg-white/10 hover:bg-white/15 border-white/10 text-slate-100'
+                      }`}
+                    >
+                      <span
+                        aria-hidden="true"
+                        className="w-3.5 h-3.5 rounded border border-white/30 shrink-0"
+                        style={{ background: bg.swatchStyle }}
+                      />
+                      <span className="truncate">{bg.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Contextual lighting controls */}
       {lightingOpen && (!editMode || !selectedDecor) && (

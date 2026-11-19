@@ -1,4 +1,17 @@
-export type FishSpecies = 'clown' | 'tang' | 'goldfish';
+export type FishSpecies = 'goldfish' | 'clown' | 'tang' | 'koi';
+
+export type GoldfishVariety =
+  | 'metallic_orange'
+  | 'sarasa'
+  | 'calico'
+  | 'red_cap'
+  | 'sakura'
+  | 'tiger'
+  | 'panda'
+  | 'black_oranda'
+  | 'lemon'
+  | 'chocolate';
+
 
 export interface Fish {
   id: string;
@@ -144,3 +157,19 @@ export interface AquariumLighting {
   intensity: number; // 0.15 .. 1.6
 }
 
+export type TankSizePreset = 'compact' | 'standard' | 'large' | 'panoramic' | 'custom';
+
+export interface TankDimensions {
+  preset: TankSizePreset;
+  width: number; // 3.6 .. 7.6
+  height: number; // 2.4 .. 4.0
+  depth: number; // 2.2 .. 4.2
+}
+
+export type AquariumBackgroundId =
+  | 'natural'
+  | 'reef'
+  | 'amazon'
+  | 'slate'
+  | 'frosted'
+  | 'abyss';

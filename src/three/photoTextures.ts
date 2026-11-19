@@ -4,9 +4,11 @@ import macroSandUrl from '../assets/images/macro_aquarium_sand_1794778201320.jpg
 import macroRockUrl from '../assets/images/macro_wet_rock_1794778201956.jpg';
 import macroSwordUrl from '../assets/images/macro_leaf_sword_1794778202485.jpg';
 import macroVallisneriaUrl from '../assets/images/macro_leaf_vallisneria_1794778202347.jpg';
+import type { AquariumBackgroundId } from '../types/aquarium';
 
 export interface AquariumPhotoTextures {
   backdropMap: THREE.Texture | null;
+  backdrops: Record<AquariumBackgroundId, THREE.Texture | null>;
   sandAlbedo: THREE.CanvasTexture;
   sandNormal: THREE.CanvasTexture;
   sandRoughness: THREE.CanvasTexture;
@@ -277,6 +279,182 @@ function buildVallisneriaBladeCanvas(img: HTMLImageElement | null): HTMLCanvasEl
   return canvas;
 }
 
+function createProceduralBackdropTexture(
+  id: AquariumBackgroundId,
+  maxAnisotropy: number
+): THREE.CanvasTexture {
+  const w = 768;
+  const h = 432;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d')!;
+
+  if (id === 'frosted') {
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0.0, '#f8fdff');
+    grad.addColorStop(0.35, '#d4effa');
+    grad.addColorStop(0.75, '#9cd3eb');
+    grad.addColorStop(1.0, '#66a4c7');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+
+    const glow = ctx.createRadialGradient(w * 0.5, h * 0.18, 24, w * 0.5, h * 0.36, w * 0.62);
+    glow.addColorStop(0, 'rgba(255, 255, 255, 0.55)');
+    glow.addColorStop(0.6, 'rgba(220, 246, 255, 0.18)');
+    glow.addColorStop(1, 'rgba(25, 80, 118, 0.24)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.filter = 'blur(12px)';
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.24)';
+    ctx.beginPath();
+    ctx.ellipse(w * 0.35, h * 0.24, 190, 42, -0.05, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(w * 0.72, h * 0.32, 160, 36, 0.06, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.filter = 'none';
+  } else if (id === 'slate') {
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0.0, '#273240');
+    grad.addColorStop(0.55, '#141b25');
+    grad.addColorStop(1.0, '#080c12');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.filter = 'blur(8px)';
+    for (let i = 0; i < 8; i++) {
+      const rx = (i / 7) * w;
+      const rw = 115 + (i % 3) * 42;
+      const rh = 120 + (i % 4) * 38;
+      ctx.fillStyle = i % 2 === 0 ? 'rgba(95, 122, 148, 0.22)' : 'rgba(8, 12, 18, 0.52)';
+      ctx.beginPath();
+      ctx.moveTo(rx - rw * 0.5, h);
+      ctx.lineTo(rx - rw * 0.18, h - rh);
+      ctx.lineTo(rx + rw * 0.26, h - rh * 0.82);
+      ctx.lineTo(rx + rw * 0.56, h);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.filter = 'none';
+
+    const spot = ctx.createRadialGradient(w * 0.5, 0, 18, w * 0.5, h * 0.14, w * 0.62);
+    spot.addColorStop(0, 'rgba(130, 178, 206, 0.18)');
+    spot.addColorStop(1, 'rgba(3, 6, 12, 0.48)');
+    ctx.fillStyle = spot;
+    ctx.fillRect(0, 0, w, h);
+  } else if (id === 'reef') {
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0.0, '#1ab0d4');
+    grad.addColorStop(0.34, '#0a6d9c');
+    grad.addColorStop(0.74, '#053b63');
+    grad.addColorStop(1.0, '#021b33');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.filter = 'blur(9px)';
+    const shafts = [0.22, 0.48, 0.74];
+    for (const sx of shafts) {
+      const sg = ctx.createLinearGradient(w * sx, 0, w * (sx + 0.08), h * 0.88);
+      sg.addColorStop(0, 'rgba(175, 245, 255, 0.34)');
+      sg.addColorStop(1, 'rgba(175, 245, 255, 0.0)');
+      ctx.fillStyle = sg;
+      ctx.beginPath();
+      ctx.moveTo(w * (sx - 0.05), 0);
+      ctx.lineTo(w * (sx + 0.05), 0);
+      ctx.lineTo(w * (sx + 0.17), h * 0.9);
+      ctx.lineTo(w * (sx - 0.02), h * 0.9);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(3, 28, 52, 0.78)';
+    for (let i = 0; i < 6; i++) {
+      const cx = 65 + i * 132;
+      const cy = h - 22 - (i % 2) * 30;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, 98 + (i % 3) * 24, 72 + (i % 2) * 34, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(36, 198, 206, 0.30)';
+    for (let i = 0; i < 4; i++) {
+      const cx = 110 + i * 168;
+      ctx.beginPath();
+      ctx.ellipse(cx, h - 82 - (i % 2) * 22, 46, 30, (i - 1.5) * 0.25, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(244, 128, 96, 0.22)';
+    for (let i = 0; i < 3; i++) {
+      const cx = 190 + i * 195;
+      ctx.beginPath();
+      ctx.ellipse(cx, h - 72 - (i % 2) * 16, 32, 24, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.filter = 'none';
+  } else if (id === 'amazon') {
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0.0, '#3e855c');
+    grad.addColorStop(0.36, '#184a36');
+    grad.addColorStop(0.78, '#0b2b20');
+    grad.addColorStop(1.0, '#04140f');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.filter = 'blur(8px)';
+    ctx.strokeStyle = 'rgba(6, 26, 18, 0.78)';
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 18; i++) {
+      const bx = 24 + i * 43 + ((i * 19) % 17);
+      const topY = 44 + ((i * 37) % 130);
+      ctx.lineWidth = 10 + (i % 4) * 5;
+      ctx.beginPath();
+      ctx.moveTo(bx, h + 10);
+      ctx.quadraticCurveTo(bx + ((i % 2 === 0 ? 1 : -1) * 28), (h + topY) * 0.5, bx + (i % 3 - 1) * 22, topY);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(116, 190, 110, 0.22)';
+    for (let i = 0; i < 8; i++) {
+      ctx.beginPath();
+      ctx.ellipse(70 + i * 92, 125 + (i % 3) * 44, 52, 95, (i % 2 === 0 ? 0.2 : -0.2), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.filter = 'none';
+
+    const canopyGlow = ctx.createRadialGradient(w * 0.45, 0, 18, w * 0.48, h * 0.2, w * 0.58);
+    canopyGlow.addColorStop(0, 'rgba(222, 240, 158, 0.30)');
+    canopyGlow.addColorStop(1, 'rgba(4, 18, 12, 0.42)');
+    ctx.fillStyle = canopyGlow;
+    ctx.fillRect(0, 0, w, h);
+  } else if (id === 'abyss') {
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0.0, '#14589c');
+    grad.addColorStop(0.32, '#083063');
+    grad.addColorStop(0.75, '#031533');
+    grad.addColorStop(1.0, '#010716');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+
+    const cone = ctx.createRadialGradient(w * 0.5, -20, 18, w * 0.5, h * 0.22, w * 0.56);
+    cone.addColorStop(0, 'rgba(104, 198, 255, 0.38)');
+    cone.addColorStop(0.55, 'rgba(20, 86, 158, 0.16)');
+    cone.addColorStop(1, 'rgba(1, 8, 22, 0.48)');
+    ctx.fillStyle = cone;
+    ctx.fillRect(0, 0, w, h);
+  } else {
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0.0, '#2a8ab8');
+    grad.addColorStop(0.5, '#12537a');
+    grad.addColorStop(1.0, '#062640');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAnisotropy;
+  return tex;
+}
+
 export async function loadAquariumPhotoTextures(
   maxAnisotropy: number
 ): Promise<AquariumPhotoTextures> {
@@ -294,8 +472,8 @@ export async function loadAquariumPhotoTextures(
   const swordImg = swordRes.status === 'fulfilled' ? swordRes.value : null;
   const valImg = valRes.status === 'fulfilled' ? valRes.value : null;
 
-  // 1. Softly blurred underwater backdrop for rear glass depth
-  let backdropMap: THREE.Texture | null = null;
+  // 1. Softly blurred underwater backdrop variants for rear glass depth
+  let naturalBackdrop: THREE.Texture | null = null;
   if (backdropImg) {
     const bgCanvas = document.createElement('canvas');
     bgCanvas.width = 768;
@@ -312,10 +490,21 @@ export async function loadAquariumPhotoTextures(
     bgCtx.fillStyle = grad;
     bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
 
-    backdropMap = new THREE.CanvasTexture(bgCanvas);
-    backdropMap.colorSpace = THREE.SRGBColorSpace;
-    backdropMap.anisotropy = maxAnisotropy;
+    naturalBackdrop = new THREE.CanvasTexture(bgCanvas);
+    naturalBackdrop.colorSpace = THREE.SRGBColorSpace;
+    naturalBackdrop.anisotropy = maxAnisotropy;
+  } else {
+    naturalBackdrop = createProceduralBackdropTexture('natural', maxAnisotropy);
   }
+
+  const backdrops: Record<AquariumBackgroundId, THREE.Texture | null> = {
+    natural: naturalBackdrop,
+    reef: createProceduralBackdropTexture('reef', maxAnisotropy),
+    amazon: createProceduralBackdropTexture('amazon', maxAnisotropy),
+    slate: createProceduralBackdropTexture('slate', maxAnisotropy),
+    frosted: createProceduralBackdropTexture('frosted', maxAnisotropy),
+    abyss: createProceduralBackdropTexture('abyss', maxAnisotropy),
+  };
 
   // 2. Macro Quartz Sand PBR set
   const sandCanvas = imageToCanvas(sandImg, 512, 512, '#bda988', {
@@ -395,7 +584,8 @@ export async function loadAquariumPhotoTextures(
   });
 
   return {
-    backdropMap,
+    backdropMap: naturalBackdrop,
+    backdrops,
     sandAlbedo,
     sandNormal,
     sandRoughness,
@@ -410,7 +600,17 @@ export async function loadAquariumPhotoTextures(
 }
 
 export function disposeAquariumPhotoTextures(tex: AquariumPhotoTextures): void {
-  tex.backdropMap?.dispose();
+  const seen = new Set<THREE.Texture>();
+  if (tex.backdropMap) {
+    tex.backdropMap.dispose();
+    seen.add(tex.backdropMap);
+  }
+  for (const b of Object.values(tex.backdrops)) {
+    if (b && !seen.has(b)) {
+      b.dispose();
+      seen.add(b);
+    }
+  }
   tex.sandAlbedo.dispose();
   tex.sandNormal.dispose();
   tex.sandRoughness.dispose();

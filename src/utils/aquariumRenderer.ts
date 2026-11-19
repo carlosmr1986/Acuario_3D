@@ -868,7 +868,8 @@ export function renderAquarium(
       );
     } else {
       const fish = entry.item;
-      const sprite = sprites?.fish[fish.species] ?? null;
+      const spriteKey = fish.species === 'koi' ? 'goldfish' : fish.species;
+      const sprite = sprites?.fish[spriteKey] ?? null;
       drawPhotoFish(ctx, fish, state.time, width, height, sprite);
     }
   }
