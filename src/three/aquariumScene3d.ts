@@ -20,6 +20,7 @@ import {
   createHyperrealisticFish3D,
   createSpeciesTextureSet,
   disposeSpeciesTextureSet,
+  updateFishSkeleton,
   type FishRig3D,
   type SpeciesTextureSet,
 } from './fish3d';
@@ -100,6 +101,11 @@ interface FishEntity3D {
   bobFreq: number;
   bobAmp: number;
   swimPhase: number;
+  scullPhase: number;
+  breathPhase: number;
+  burstPhase: number;
+  swimEffort: number;
+  turnBendSmooth: number;
   spawnScale: number;
   baseScale: number;
   satiety: number;
@@ -1704,8 +1710,13 @@ void main() {
       fleeTimer: 0,
       bobPhase: Math.random() * Math.PI * 2,
       bobFreq: 1.45 + Math.random() * 0.45,
-      bobAmp: 0.035,
+      bobAmp: 0.032,
       swimPhase: Math.random() * Math.PI * 2,
+      scullPhase: Math.random() * Math.PI * 2,
+      breathPhase: Math.random() * Math.PI * 2,
+      burstPhase: Math.random() * Math.PI * 2,
+      swimEffort: 0.85,
+      turnBendSmooth: 0,
       spawnScale: 0.08,
       baseScale,
       satiety,
@@ -1821,7 +1832,7 @@ void main() {
 
   public addFish(): void {
     if (!this.editMode) return;
-    const order: FishSpecies[] = ['tang', 'goldfish', 'clown'];
+    const order: FishSpecies[] = ['goldfish', 'tang', 'clown'];
     const species = order[this.nextExtraSpeciesIdx % order.length];
     this.nextExtraSpeciesIdx += 1;
     const pos = this.pickNonOverlappingFishSpawn();
@@ -1897,6 +1908,7 @@ void main() {
 
     for (const f of this.fishList) {
       this.scene.remove(f.rig.root);
+      f.rig.skeleton.dispose();
       for (const g of f.rig.geometries) g.dispose();
       for (const m of f.rig.materials) m.dispose();
     }
@@ -3115,15 +3127,26 @@ void main() {
       }
 
       const hungerDrive = f.satiety < 0.45 ? 1.14 : f.satiety > 1.15 ? 0.88 : 1.0;
+
+      // Natural burst-and-coast (tail kick + hydrodynamic glide) cycle when cruising calmly
+      f.burstPhase += dt * (0.72 + (f.baseSpeed - 0.54) * 0.5) * motionScale;
+      const glideWave = 0.5 + 0.5 * Math.sin(f.burstPhase + Math.sin(f.burstPhase * 0.43) * 0.7);
+      const cruiseEffort = 0.36 + 0.84 * Math.pow(glideWave, 1.35);
+      const targetEffort =
+        f.fleeTimer > 0
+          ? 1.55 + (f.fleeTimer / 1.25) * 0.9
+          : chasedFood
+            ? 1.38 * hungerDrive
+            : cruiseEffort * hungerDrive;
+      f.swimEffort += (targetEffort - f.swimEffort) * Math.min(1, dt * (f.fleeTimer > 0 || chasedFood ? 6.5 : 3.2));
+
       const desiredSpeed =
         f.fleeTimer > 0
           ? f.baseSpeed * (1.25 + (f.fleeTimer / 1.25) * 1.9)
           : chasedFood
             ? f.baseSpeed * 1.88 * hungerDrive
-            : f.baseSpeed *
-              hungerDrive *
-              (0.92 + 0.16 * Math.sin(this.elapsedTime * 0.7 + f.bobPhase));
-      f.speed += (desiredSpeed - f.speed) * Math.min(1, dt * 3.8);
+            : f.baseSpeed * hungerDrive * (0.64 + 0.58 * f.swimEffort);
+      f.speed += (desiredSpeed - f.speed) * Math.min(1, dt * (f.fleeTimer > 0 || chasedFood ? 4.4 : 2.6));
 
       const horizLen = Math.max(0.001, Math.hypot(_vec3A.x, _vec3A.z));
       const desiredYaw = Math.atan2(-_vec3A.z, _vec3A.x);
@@ -3221,33 +3244,31 @@ void main() {
         }
       }
 
-      const chompBoost = f.chompTimer > 0 ? 1.55 : 1.0;
+      const chompBoost = f.chompTimer > 0 ? 1.45 : 1.0;
       const speedNorm = f.speed / Math.max(0.01, f.baseSpeed);
-      f.swimPhase += dt * (4.6 + speedNorm * 4.4) * chompBoost * motionScale;
-      f.rig.uniforms.uTime.value = this.elapsedTime;
-      f.rig.uniforms.uSwimPhase.value = f.swimPhase;
-      f.rig.uniforms.uSwimAmp.value =
-        (0.028 + 0.018 * Math.min(2.6, speedNorm)) *
-        (f.chompTimer > 0 ? 1.3 : 1.0) *
-        motionScale;
+      // Spine wave frequency accelerates on kicks & coasts slower during glide
+      f.swimPhase += dt * (3.1 + f.swimEffort * 4.6 + speedNorm * 1.4) * chompBoost * motionScale;
+      // Pectoral sculling is more active during slow glides, hovering, and turns
+      const scullRate = 2.6 + (1.4 - Math.min(1.1, f.swimEffort * 0.55)) * 1.6 + Math.min(1.5, Math.abs(yawStep));
+      f.scullPhase += dt * scullRate * motionScale;
+      f.breathPhase += dt * (2.3 + Math.min(2.2, f.swimEffort * 1.1)) * motionScale;
 
-      const targetBend = THREE.MathUtils.clamp(-yawStep * 0.13, -0.22, 0.22);
-      f.rig.uniforms.uTurnBend.value +=
-        (targetBend - f.rig.uniforms.uTurnBend.value) * Math.min(1, dt * 5.0);
+      const targetBend = THREE.MathUtils.clamp(-yawStep * 0.22, -0.34, 0.34);
+      f.turnBendSmooth += (targetBend - f.turnBendSmooth) * Math.min(1, dt * 5.2);
 
-      const turnMag = Math.min(1, Math.abs(yawStep) / 1.2);
-      const pectBaseFlare = 0.28 + turnMag * 0.42;
-      const scullL = Math.sin(f.swimPhase * 0.85) * 0.24 * motionScale;
-      const scullR = Math.sin(f.swimPhase * 0.85 + 0.9) * 0.24 * motionScale;
-
-      f.rig.leftPectoral.rotation.y = pectBaseFlare + scullL;
-      f.rig.leftPectoral.rotation.z = -0.18 + Math.cos(f.swimPhase * 0.85) * 0.14 * motionScale;
-
-      f.rig.rightPectoral.rotation.y = -(pectBaseFlare + scullR);
-      f.rig.rightPectoral.rotation.z = -0.18 + Math.cos(f.swimPhase * 0.85 + 0.9) * 0.14 * motionScale;
-
-      f.rig.leftPelvic.rotation.y = 0.15 + scullL * 0.45;
-      f.rig.rightPelvic.rotation.y = -(0.15 + scullR * 0.45);
+      const chompRatio = f.chompTimer > 0 ? Math.sin((f.chompTimer / 0.32) * Math.PI) : 0;
+      updateFishSkeleton(f.rig, this.elapsedTime, {
+        swimPhase: f.swimPhase,
+        scullPhase: f.scullPhase,
+        breathPhase: f.breathPhase,
+        effort: f.swimEffort * (f.chompTimer > 0 ? 1.2 : 1.0),
+        speedNorm,
+        yawRate: yawStep,
+        pitchAngle: f.pitch,
+        chompRatio,
+        motionScale,
+        turnBendSmooth: f.turnBendSmooth,
+      });
     }
 
     if (ateAnyFood) {
@@ -3772,6 +3793,9 @@ void main() {
     dom.removeEventListener('pointercancel', this.handlePointerUp);
     dom.removeEventListener('webglcontextlost', this.handleContextLost);
 
+    for (const f of this.fishList) {
+      f.rig.skeleton.dispose();
+    }
     this.scene.traverse((obj) => {
       if (
         obj instanceof THREE.Mesh ||
